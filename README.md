@@ -1,6 +1,6 @@
 # deleg8r
 
-A local stdio MCP and hooks for Claude Code and Codex. Requires a POSIX shell, curl, Python 3.8+ with SQLite FTS5, and the relevant signed-in coding CLI on PATH.
+A local stdio MCP and hooks for Claude Code and Codex. Requires a POSIX shell, curl, Python 3.9+ with SQLite FTS5, and the relevant signed-in coding CLI on PATH.
 
 ## Install and update
 
@@ -39,15 +39,21 @@ deleg8r monitor --task TASK_ID --once
 deleg8r export TASK_ID > task.json
 ```
 
-To use the interactive node canvas, install the optional Textual dependency in the same Python environment that runs your Deleg8r launcher:
-
-```sh
-pip install textual
-```
+Install and update set up Textual automatically. When the required version is missing, Deleg8r installs it into its private runtime directory. The bootstrap needs access to your configured Python package index and a Python with `venv` and `ensurepip` available.
 
 The monitor uses the canvas when Textual is available. Tab or keys 1–9 select nodes, the arrow keys move the selected node and reroute its connections, G returns to the timeline, and Q quits. The canvas scrolls as you move or select nodes. Each node shows its position and live status. Use `monitor --classic` for the original terminal graph, which is also the default without Textual.
 
 Copy the full task ID from the monitor details or MCP `status` result. The JSON export includes the current plan, reports, tests, review history with revisions and verdicts, model usage and duration, MCP call counts and errors, and reported worker usage. Exports include task evidence. Review history starts with reviews recorded after upgrading.
+
+### Dashboard for one chat
+
+```sh
+deleg8r dashboard --chat CHAT_KEY
+```
+
+Use the main-thread memory key from the chat's Deleg8r routing context. You can also set `DELEG8R_CHAT` and run `deleg8r dashboard` without arguments. The dashboard accepts the same `--db` option as the monitor.
+
+Use F1 for **Timeline**, F2 for **Stats**, and F3 for **Graph**. Stats aggregate recorded activity for this chat, including task-linked MCP calls. Graph follows the newest prompt by default. Select any timeline row and press Enter to keep following that prompt or task across tab switches. This also works before the prompt has a plan.
 
 Both commands use plain text when piped or with `--plain`. For the monitor, `--tail 0` shows only new events and `--once` prints history and exits. `stats`, `monitor`, and `export` accept `--db /absolute/path/state.sqlite3` for project-only setups. Restart active clients after updating so their MCP process can record new events.
 

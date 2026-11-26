@@ -370,6 +370,64 @@ class InstallTest(unittest.TestCase):
 
         asyncio.run(check_graph())
 
+    @unittest.skipUnless(importlib.util.find_spec("textual"), "needs optional Textual dependency")
+    def test_dashboard_scopes_timeline_stats_and_graph_to_one_chat(self):
+        database = self.state / "state.sqlite3"
+        store = Store(database)
+        self.addCleanup(store.db.close)
+
+        def make_task(thread, turn, step, tokens):
+            store.set_prompt_gate(thread, turn, True, client="codex", route="focused")
+            task = store.create_task(thread, "codex", "focused", {
+                "steps": [{"id": step, "needs": [], "mode": "read"}],
+            }, turn=turn)
+            store.record_model_usage("codex", "plan", "fixture", thread, turn, task["id"], 1,
+                                     {"input_tokens": tokens})
+            return task["id"]
+
+        first = make_task("current", "first", "first-step", 11)
+        second = make_task("current", "second", "second-step", 22)
+        other = make_task("unrelated", "third", "private-step", 9999)
+        store.record_tool_call("remember", first, True, "current", "codex", "first-step")
+        store.record_tool_call("recall", other, True, "unrelated", "codex", "private-step")
+        store.remember("current", "note", "fact", "Private memory body")
+
+        async def check_dashboard():
+            app = textual_graph(store, thread="current", path=database)
+            async with app.run_test(size=(110, 28)) as pilot:
+                self.assertEqual(app.tabs.active, "timeline")
+                self.assertGreater(app.timeline.region.height, 4)
+                self.assertEqual(app.query_one("Footer").region.height, 1)
+                self.assertEqual({row["task_id"] for row in app.rows.values()}, {first, second})
+                await pilot.press("f2")
+                await pilot.pause()
+                stats = str(app.stats_text.render())
+                self.assertIn("2 tasks in this chat", stats)
+                self.assertRegex(stats, r"plan input +33")
+                self.assertIn("MCP: remember", stats)
+                self.assertNotIn("MCP: recall", stats)
+                self.assertNotIn("9999", stats)
+                await pilot.press("f3")
+                await pilot.pause()
+                self.assertEqual(app.task_id, second)
+                self.assertIn("second-step", app.canvas.nodes)
+                await pilot.press("f1")
+                index = next(index for index, row in enumerate(app.rows.values()) if row["task_id"] == first)
+                app.timeline.move_cursor(row=index)
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertEqual(app.tabs.active, "graph")
+                self.assertEqual(app.task_id, first)
+                self.assertIn("@memory", app.canvas.nodes)
+                await pilot.press("f2", "f3")
+                await pilot.pause()
+                self.assertEqual(app.task_id, first)
+                self.assertNotIn("private-step", app.canvas.nodes)
+                self.assertNotIn("Private memory body", str(app.canvas.snapshot))
+                await pilot.press("q")
+
+        asyncio.run(check_dashboard())
+
     def test_activity_cli_opens_legacy_database(self):
         self.install("--no-setup")
         database = self.state / "state.sqlite3"

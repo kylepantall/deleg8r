@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import fcntl
 import heapq
+import importlib.metadata
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import venv
 from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +33,7 @@ except ImportError:
 
 
 APP = "deleg8r"
+TEXTUAL_VERSION = "8.2.8"
 SERVER = "task_delegation"
 FILES = ("delegate.py", "models.py", "models.json", "store.py", "installer.py", "install.sh", "README.md")
 
@@ -127,6 +130,39 @@ def verify_sqlite():
             raise ValueError("Python's SQLite library must support FTS5") from error
 
 
+def dashboard_packages(root):
+    python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return root / "runtime" / f"textual-{TEXTUAL_VERSION}-py{python}"
+
+
+def install_dashboard_packages(root):
+    packages = dashboard_packages(root)
+    if packages.is_dir():
+        return
+    try:
+        if importlib.metadata.version("textual") == TEXTUAL_VERSION:
+            import textual
+            from textual.widgets import DataTable, TabbedContent
+            return
+    except (ImportError, importlib.metadata.PackageNotFoundError):
+        pass
+
+    packages.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".dependencies-", dir=packages.parent) as folder:
+        staging = Path(folder)
+        environment = staging / "pip-env"
+        venv.EnvBuilder(with_pip=True).create(environment)
+        python = environment / "bin" / "python"
+        vendor = staging / "packages"
+        subprocess.run([str(python), "-m", "pip", "--disable-pip-version-check", "install", "--only-binary=:all:",
+                        "--target", str(vendor), f"textual=={TEXTUAL_VERSION}"], check=True)
+        subprocess.run([str(python), "-I", "-c",
+                        "import sys; sys.path.insert(0, sys.argv[1]); "
+                        "from textual.app import App; from textual.widgets import DataTable, TabbedContent",
+                        str(vendor)], check=True)
+        os.replace(vendor, packages)
+
+
 def install_release(source, revision, root, bin_dir):
     verify_sqlite()
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
@@ -156,6 +192,7 @@ def install_release(source, revision, root, bin_dir):
                 read_json(staged / "models.json")
                 (staged / "revision").write_text(revision + "\n", encoding="utf-8")
                 os.replace(staged, release)
+        install_dashboard_packages(root)
         with tempfile.TemporaryDirectory(prefix=".switch-", dir=root) as directory:
             pointer = Path(directory) / "current"
             pointer.symlink_to(release, target_is_directory=True)
@@ -438,16 +475,20 @@ def chart(title, counts):
         print(f"  {terminal_text(label):<18} {count:>6}  {'#' * length}")
 
 
-def activity_counts(path):
+def activity_counts(path, thread=None):
     task_states = Counter({"completed": 0})
     tiers, clients, modes, agents = Counter(), Counter(), Counter(), Counter()
     with contextlib.closing(Store(path).db) as db:
         routes = Counter({
             row["detail"]: row["total"] for row in db.execute(
-                "SELECT detail, count(*) AS total FROM activity WHERE kind='route' GROUP BY detail"
+                """SELECT detail, count(*) AS total FROM activity
+                   LEFT JOIN prompt_activity ON prompt_activity.event_id=activity.id
+                   WHERE kind='route' AND (? IS NULL OR prompt_activity.thread=?) GROUP BY detail""",
+                (thread, thread),
             )
         })
-        for row in db.execute("SELECT client,tier,plan,reports FROM tasks"):
+        for row in db.execute("SELECT client,tier,plan,reports FROM tasks WHERE ? IS NULL OR thread=?",
+                              (thread, thread)):
             tiers[row["tier"]] += 1
             clients[row["client"]] += 1
             steps = json.loads(row["plan"])["steps"]
@@ -473,15 +514,17 @@ def activity_counts(path):
         tokens, tools = Counter(), Counter()
         token_labels = (("input_tokens", "input"), ("output_tokens", "output"),
                         ("cached_input_tokens", "cached"))
-        for row in db.execute("""SELECT phase,usage FROM model_usage
-                                 UNION ALL SELECT 'worker',usage FROM worker_usage"""):
+        scope = "(? IS NULL OR task_id IN (SELECT id FROM tasks WHERE thread=?))"
+        for row in db.execute(f"""SELECT phase,usage FROM model_usage WHERE ? IS NULL OR thread=?
+                                  UNION ALL SELECT 'worker',usage FROM worker_usage WHERE {scope}""",
+                              (thread, thread, thread, thread)):
             usage = json.loads(row["usage"])
             for field, label in token_labels:
                 if field in usage:
                     tokens[f"{row['phase']} {label}"] += usage[field]
-        for row in db.execute("SELECT name,count(*) AS calls FROM tool_calls GROUP BY name"):
+        for row in db.execute(f"SELECT name,count(*) AS calls FROM tool_calls WHERE {scope} GROUP BY name", (thread, thread)):
             tools[f"MCP: {row['name']}"] = row["calls"]
-        for row in db.execute("SELECT usage FROM worker_usage"):
+        for row in db.execute(f"SELECT usage FROM worker_usage WHERE {scope}", (thread, thread)):
             usage = json.loads(row["usage"])
             for tool in usage.get("tools", []):
                 tools[f"Worker: {tool['name']}"] += tool["calls"]
@@ -660,14 +703,14 @@ def task_graph(store, task_id):
 
 
 # pip install textual
-def textual_graph(store, task_id, prompt_id=None):
+def textual_graph(store, task_id=None, prompt_id=None, *, thread=None, path=None):
     """Open the optional Textual view. Import it only for interactive graphs."""
     from rich.text import Text
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import ScrollableContainer
     from textual.geometry import Offset, Region
-    from textual.widgets import Footer, Static
+    from textual.widgets import DataTable, Footer, Static, TabbedContent, TabPane
 
     node_width, node_height = 22, 5
     directions = ((1, 0), (0, 1), (0, -1), (-1, 0))
@@ -821,6 +864,14 @@ def textual_graph(store, task_id, prompt_id=None):
         .graph-node { layer: nodes; position: absolute; width: 22; height: 5;
                       padding: 0 1; border: round #546d8c; background: #1b2839; color: #e3eefb; }
         .graph-node.selected { border: round #66f4cc; background: #24394a; }
+        Footer { dock: bottom; height: 1; }
+        TabbedContent { height: 1fr; }
+        TabbedContent > ContentSwitcher { height: 1fr; }
+        TabPane { height: 1fr; }
+        #dashboard-timeline { height: 1fr; }
+        #dashboard-hint { height: 1; padding: 0 1; color: #84e6d5; }
+        #dashboard-stats { width: auto; height: auto; padding: 1 2; }
+        #dashboard-graph-title { height: 1; padding: 0 1; color: #84e6d5; }
         """
         BINDINGS = [
             Binding("left", "move(-1, 0)", show=False, priority=True),
@@ -871,7 +922,119 @@ def textual_graph(store, task_id, prompt_id=None):
         def action_timeline(self) -> None:
             self.exit(True)
 
-    return NodeGraphApp()
+    class ChatDashboard(NodeGraphApp):
+        BINDINGS = [
+            Binding("f1", "show_tab('timeline')", "Timeline", priority=True),
+            Binding("f2", "show_tab('stats')", "Stats", priority=True),
+            Binding("f3", "show_tab('graph')", "Graph", priority=True),
+        ]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.tabs = TabbedContent(initial="timeline")
+            self.heading = Static(id="dashboard-graph-title", markup=False)
+            self.timeline = DataTable(id="dashboard-timeline", cursor_type="row")
+            self.stats_text = Static(id="dashboard-stats", markup=False)
+            self.rows = {}
+            self.follow = None
+            self.shown_task = None
+
+        def compose(self) -> ComposeResult:
+            yield Static(f"Deleg8r · Chat {thread}", id="graph-heading", markup=False)
+            with self.tabs:
+                with TabPane("Timeline", id="timeline"):
+                    yield Static("↑/↓ Browse  ·  Enter Follow in Graph  ·  Latest prompt followed by default",
+                                 id="dashboard-hint", markup=False)
+                    yield self.timeline
+                with TabPane("Stats", id="stats"):
+                    yield ScrollableContainer(self.stats_text)
+                with TabPane("Graph", id="graph"):
+                    yield self.heading
+                    yield ScrollableContainer(self.canvas)
+            yield Footer()
+
+        async def on_mount(self) -> None:
+            self.timeline.add_columns("Time", "Client", "Event", "Status / route", "Step", "Agent", "Task")
+            await self.refresh_task()
+            self.timeline.focus()
+            self.set_interval(1, self.refresh_task)
+
+        async def refresh_task(self) -> None:
+            rows = {row["key"]: dict(row) for row in store.chat_timeline(thread)}
+            if self.rows != rows:
+                index = self.timeline.cursor_row
+                old_key = list(self.rows)[index] if 0 <= index < len(self.rows) else None
+                self.timeline.clear()
+                for row in rows.values():
+                    stamp = datetime.fromtimestamp(row["created"]).strftime("%H:%M:%S")
+                    self.timeline.add_row(stamp, *(terminal_text(str(row[field] or ""))
+                                                   for field in ("client", "kind", "detail", "step_id", "agent_name")),
+                                          (row["task_id"] or "")[:10], key=row["key"])
+                self.rows = rows
+                if old_key in rows:
+                    self.timeline.move_cursor(row=list(rows).index(old_key))
+
+            if self.tabs.active == "stats":
+                total, charts = activity_counts(path, thread)
+                output = Text(f"{total} tasks in this chat\n", style="bold")
+                for title, counts in charts:
+                    output.append(f"\n{title}\n", style="bold cyan")
+                    peak = max(counts.values(), default=0)
+                    if not counts:
+                        output.append("  No recorded activity\n", style="dim")
+                    for label, count in counts.most_common():
+                        width = max(1, round(26 * count / peak)) if peak and count else 0
+                        output.append(f"  {terminal_text(label):22} {count:>8}  ")
+                        output.append("█" * width + "\n", style="cyan")
+                self.stats_text.update(output)
+
+            if self.tabs.active != "graph":
+                return
+            if self.follow:
+                selected, prompt_id = self.follow
+                if not selected and prompt_id:
+                    selected = store.task_for_prompt(prompt_id)
+                has_activity = True
+            else:
+                row = next((row for row in rows.values() if row["prompt_id"]), None)
+                row = row or next(iter(rows.values()), None)
+                selected = row["task_id"] if row else None
+                has_activity = bool(row)
+            if self.shown_task != selected:
+                await self.canvas.sync({}, ())
+                self.shown_task = selected
+            self.task_id = selected
+            if selected:
+                await super().refresh_task()
+            else:
+                self.heading.update("Waiting for a plan linked to this prompt" if has_activity else "No activity in this chat yet")
+
+        async def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+            row = self.rows.get(event.row_key.value)
+            if not row:
+                return
+            self.follow = (row["task_id"], row["prompt_id"])
+            self.tabs.active = "graph"
+            await self.refresh_task()
+
+        async def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+            if event.pane.id == "timeline":
+                self.timeline.focus()
+            if self.timeline.columns:
+                await self.refresh_task()
+
+        def check_action(self, action: str, parameters: tuple) -> bool | None:
+            if action in {"move", "next_node", "select_node"}:
+                return self.tabs.active == "graph"
+            return super().check_action(action, parameters)
+
+        def action_show_tab(self, tab: str) -> None:
+            self.tabs.active = tab
+
+        def action_timeline(self) -> None:
+            self.action_show_tab("timeline")
+
+    return ChatDashboard() if thread else NodeGraphApp()
 
 
 def graph_canvas_data(store, task_id):
@@ -1076,8 +1239,8 @@ def monitor(path, tail, once, plain=False, task_id=None, classic=False):
 
 
 def main():
-    if sys.version_info < (3, 8):
-        raise ValueError("Python 3.8 or newer is required")
+    if sys.version_info < (3, 9):
+        raise ValueError("Python 3.9 or newer is required")
     parser = argparse.ArgumentParser(prog=APP, description=__doc__)
     parser.add_argument("--root", type=Path, default=default_root())
     parser.add_argument("--bin-dir", type=Path, default=default_bin())
@@ -1101,6 +1264,10 @@ def main():
     export = commands.add_parser("export", help="Export one task and its reviews as JSON")
     export.add_argument("task_id", help="Task ID from the monitor or MCP status")
     export.add_argument("--db", type=Path, help="Use a project-specific delegation database")
+    dashboard = commands.add_parser("dashboard", help="Open Timeline, Stats and Graph for a chat")
+    dashboard.add_argument("--chat", default=os.environ.get("DELEG8R_CHAT"),
+                           help="Chat memory key from the hook context (or DELEG8R_CHAT)")
+    dashboard.add_argument("--db", type=Path, help="Use a project-specific delegation database")
     configuration = commands.add_parser("setup", help="Alias for hook")
     configuration.add_argument("--client", choices=("auto", "claude", "codex"), default="auto")
     hook = commands.add_parser("hook", help="Connect Claude Code, Codex, or both")
@@ -1117,6 +1284,10 @@ def main():
         sub.add_argument("--client", required=True, choices=("claude", "codex"))
     args = parser.parse_args()
     root, bin_dir = args.root, args.bin_dir
+    if args.action in {"dashboard", "monitor"}:
+        packages = dashboard_packages(root)
+        if packages.is_dir():
+            sys.path.insert(0, str(packages))
     release = Path(__file__).resolve().parent
     if args.action == "_install":
         revision = args.revision
@@ -1147,6 +1318,17 @@ def main():
             stats(database, args.plain)
         else:
             monitor(database, args.tail, args.once, args.plain, args.task, args.classic)
+    elif args.action == "dashboard":
+        if not args.chat:
+            parser.error("dashboard requires --chat CHAT_KEY or DELEG8R_CHAT")
+        database = args.db.expanduser() if args.db else root / "state.sqlite3"
+        store = Store(database)
+        with contextlib.closing(store.db):
+            try:
+                app = textual_graph(store, thread=args.chat, path=database)
+            except ImportError as error:
+                raise ValueError("Install the dashboard dependency with pip install textual") from error
+            app.run()
     elif args.action == "export":
         database = args.db.expanduser() if args.db else root / "state.sqlite3"
         store = Store(database)

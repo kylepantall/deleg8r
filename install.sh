@@ -10,12 +10,12 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 compatible_python() {
-    "$1" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1
+    "$1" -c 'import sys; sys.exit(sys.version_info < (3, 9))' >/dev/null 2>&1
 }
 
 python=${DELEG8R_PYTHON:-}
 if [ -z "$python" ]; then
-    for candidate in python3 python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python3.8; do
+    for candidate in python3 python3.14 python3.13 python3.12 python3.11 python3.10 python3.9; do
         if compatible_python "$candidate"; then
             python=$candidate
             break
@@ -23,7 +23,7 @@ if [ -z "$python" ]; then
     done
 fi
 if [ -z "$python" ] || ! compatible_python "$python"; then
-    echo 'deleg8r: Python 3.8 or newer is required.' >&2
+    echo 'deleg8r: Python 3.9 or newer is required.' >&2
     echo 'If Python is installed outside PATH, set DELEG8R_PYTHON to the full path when running sh.' >&2
     exit 1
 fi

@@ -252,6 +252,22 @@ class Store:
         row = self.db.execute("SELECT task_id FROM prompt_activity WHERE event_id=?", (event_id,)).fetchone()
         return row["task_id"] if row else None
 
+    def chat_timeline(self, thread, limit=300):
+        return self.db.execute(
+            """WITH owned AS (SELECT id,client FROM tasks WHERE thread=?)
+               SELECT 'a' || activity.id AS key, activity.created, activity.client, activity.kind,
+                      activity.detail, coalesce(activity.task_id,prompt_activity.task_id) AS task_id,
+                      prompt_activity.event_id AS prompt_id, activity.step_id, activity.agent_name
+               FROM activity LEFT JOIN prompt_activity ON prompt_activity.event_id=activity.id
+               WHERE prompt_activity.thread=? OR activity.task_id IN (SELECT id FROM owned)
+               UNION ALL
+               SELECT 'r' || task_reviews.id, task_reviews.created, owned.client, 'review',
+                      json_extract(result,'$.verdict'), task_reviews.task_id, NULL, NULL, NULL
+               FROM task_reviews JOIN owned ON owned.id=task_reviews.task_id
+               ORDER BY created DESC, key DESC LIMIT ?""",
+            (thread, thread, limit),
+        ).fetchall()
+
     def graph_activity(self, task_id):
         with self.db:
             self.db.execute("BEGIN")
