@@ -1,14 +1,14 @@
 # deleg8r
 
-A local stdio MCP and hooks for Claude Code and Codex. Requires a POSIX shell, Git, Python 3.11+, SQLite with FTS5, and the relevant signed-in coding CLI on PATH.
+A local stdio MCP and hooks for Claude Code and Codex. Requires a POSIX shell, curl, Python 3.8+ with SQLite FTS5, and the relevant signed-in coding CLI on PATH.
 
 ## Install and update
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kylepantall/deleg8ter/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/kylepantall/deleg8r/main/install.sh | sh
 ```
 
-This installs `deleg8r` to `~/.local/bin` and configures the MCP and hooks at user scope for Claude Code and Codex when their CLIs are present. Restart the clients. Review and trust the new Codex hooks in `/hooks` or the desktop hook settings.
+This installs `deleg8r` to `~/.local/bin` and configures the MCP and hooks at user scope for Claude Code and Codex when their CLIs are present. The installer downloads a source archive and checks versioned Python commands when `python3` is unavailable or too old. Restart the clients. Review and trust the new Codex hooks in `/hooks` or the desktop hook settings.
 
 If you prefer project-only configuration, append `-s -- --no-setup` to the `sh` command and use the project setup below. You can configure a client later with `deleg8r setup --client claude` or `deleg8r setup --client codex`. Setup preserves other MCP servers and hooks and reports a conflict if the target MCP name already points to a different command.
 

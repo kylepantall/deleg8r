@@ -12,7 +12,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 
 from delegate import hook_configuration
@@ -55,13 +54,12 @@ def read_json(path):
     return data
 
 
-def install_release(source, root, bin_dir):
+def install_release(source, revision, root, bin_dir):
     with contextlib.closing(sqlite3.connect(":memory:")) as connection:
         try:
             connection.execute("CREATE VIRTUAL TABLE probe USING fts5(content)")
         except sqlite3.OperationalError as error:
             raise ValueError("Python's SQLite library must support FTS5") from error
-    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("Could not identify the source revision")
     launcher = bin_dir / APP
@@ -143,17 +141,17 @@ def register_claude(root, launcher):
     atomic_text(settings_path, json.dumps(settings, indent=2) + "\n")
 
 
-def read_toml(path):
-    return tomllib.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+def codex_json(root, *args):
+    output = subprocess.check_output(["codex", "mcp", *args, "--json"], cwd=root, text=True)
+    return json.loads(output)
 
 
 def register_codex(root, launcher):
     home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
     config_path = home / "config.toml"
     settings_path = home / "hooks.json"
-    config = read_toml(config_path)
-    existing = config.get("mcp_servers", {}).get(SERVER)
-    if existing is not None and not matches_server(existing, launcher, "codex"):
+    existing = next((entry for entry in codex_json(root, "list") if entry["name"] == SERVER), None)
+    if existing is not None and not matches_server(existing.get("transport"), launcher, "codex"):
         raise ValueError("Codex already has a different user MCP server named task_delegation")
     settings = settings_with_hooks(settings_path, launcher, "codex")
     if existing is None:
@@ -161,18 +159,20 @@ def register_codex(root, launcher):
             ["codex", "mcp", "add", SERVER, "--", str(launcher), "serve", "--client", "codex"],
             cwd=root, check=True,
         )
-    if not config.get("features", {}).get("hooks"):
-        subprocess.run(["codex", "features", "enable", "hooks"], cwd=root, check=True)
-    if read_toml(config_path)["mcp_servers"][SERVER].get("tool_timeout_sec") is None:
+    subprocess.run(["codex", "features", "enable", "hooks"], cwd=root, check=True)
+    if codex_json(root, "get", SERVER).get("tool_timeout_sec") is None:
         original = config_path.read_text(encoding="utf-8")
         updated, count = re.subn(r"(?m)^\[mcp_servers\.task_delegation\][ \t]*$",
                                  r"\g<0>\ntool_timeout_sec = 135", original, count=1)
         if count != 1:
             raise ValueError(f"Could not set the MCP timeout in {config_path}")
-        read = tomllib.loads(updated)
-        if read["mcp_servers"][SERVER]["tool_timeout_sec"] != 135:
-            raise ValueError("The Codex MCP timeout is invalid")
         atomic_text(config_path, updated)
+        try:
+            if codex_json(root, "get", SERVER).get("tool_timeout_sec") != 135:
+                raise ValueError("The Codex MCP timeout is invalid")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            atomic_text(config_path, original)
+            raise
     atomic_text(settings_path, json.dumps(settings, indent=2) + "\n")
 
 
@@ -202,18 +202,19 @@ def setup(root, bin_dir, client):
 
 
 def main():
-    if sys.version_info < (3, 11):
-        raise ValueError("Python 3.11 or newer is required")
+    if sys.version_info < (3, 8):
+        raise ValueError("Python 3.8 or newer is required")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=default_root())
     parser.add_argument("--bin-dir", type=Path, default=default_bin())
     commands = parser.add_subparsers(dest="action", required=True)
     install = commands.add_parser("_install")
     install.add_argument("--source", required=True, type=Path)
+    install.add_argument("--revision")
     install.add_argument("--no-setup", action="store_true")
     install.add_argument("--update", action="store_true")
     commands.add_parser("update", help="Install the latest version from GitHub")
-    commands.add_parser("version", help="Show the installed Git revision")
+    commands.add_parser("version", help="Show the installed source revision")
     configuration = commands.add_parser("setup", help="Configure detected coding clients")
     configuration.add_argument("--client", choices=("auto", "claude", "codex"), default="auto")
     for action in ("serve", "hook", "pre-tool"):
@@ -223,7 +224,11 @@ def main():
     root, bin_dir = args.root, args.bin_dir
     release = Path(__file__).resolve().parent
     if args.action == "_install":
-        revision = install_release(args.source, root, bin_dir)
+        revision = args.revision
+        if revision is None:
+            # An installed older version updates by cloning the repository.
+            revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=args.source, text=True).strip()
+        revision = install_release(args.source, revision, root, bin_dir)
         launcher = bin_dir / APP
         print(f"{'Updated' if args.update else 'Installed'} deleg8r {revision[:12]} at {launcher}", flush=True)
         if not args.no_setup:

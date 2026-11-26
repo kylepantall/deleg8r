@@ -1,10 +1,12 @@
-"""Installer lifecycle checks with a disposable Git remote and client settings."""
+"""Installer lifecycle checks with disposable source archives and client settings."""
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 import unittest
@@ -25,34 +27,35 @@ class InstallTest(unittest.TestCase):
         home.mkdir()
         self.codex = home / "codex"
         self.claude = home / "claude"
-        self.clone = folder / "remote"
-        self.clone.mkdir()
+        self.source = folder / "source"
+        self.source.mkdir()
+        self.archives = folder / "archives"
+        self.archives.mkdir()
+        self.revision_file = folder / "revision.json"
         self.state = home / "app"
         self.launcher = home / "bin" / "deleg8r"
         self.env = dict(
             os.environ, HOME=str(home), CODEX_HOME=str(self.codex), CLAUDE_CONFIG_DIR=str(self.claude),
             XDG_CACHE_HOME=str(home / "cache"), XDG_CONFIG_HOME=str(home / "config"),
-            DELEG8R_REPO_URL=self.clone.as_uri(), DELEG8R_INSTALL_DIR=str(self.state),
-            DELEG8R_BIN_DIR=str(self.launcher.parent), DELEG8R_PYTHON=sys.executable,
-            GIT_CONFIG_NOSYSTEM="1", PYTHONDONTWRITEBYTECODE="1",
+            DELEG8R_REVISION_URL=self.revision_file.as_uri(), DELEG8R_ARCHIVE_BASE=self.archives.as_uri(),
+            DELEG8R_INSTALL_DIR=str(self.state), DELEG8R_BIN_DIR=str(self.launcher.parent),
+            DELEG8R_PYTHON=os.environ.get("DELEG8R_TEST_PYTHON", sys.executable), PYTHONDONTWRITEBYTECODE="1",
         )
-        self.git("init", "-q", "-b", "main")
         for name in FILES:
-            shutil.copy2(SOURCE / name, self.clone / name)
-        self.original = self.commit("Initial fixture")
+            shutil.copy2(SOURCE / name, self.source / name)
+        self.original = self.publish("Initial fixture")
 
     def run_command(self, *argv, check=True, input=None):
         return subprocess.run(argv, env=self.env, cwd=self.env["HOME"], input=input,
                               text=True, capture_output=True, check=check, timeout=30)
 
-    def git(self, *args):
-        return self.run_command("git", "-C", str(self.clone), *args).stdout.strip()
-
-    def commit(self, message):
-        self.git("add", "-A")
-        self.git("-c", "user.name=Installer test", "-c", "user.email=fixture@example.invalid",
-                 "commit", "-qm", message)
-        return self.git("rev-parse", "HEAD")
+    def publish(self, message):
+        revision = hashlib.sha1(message.encode()).hexdigest()
+        with tarfile.open(self.archives / revision, "w:gz") as archive:
+            for name in FILES:
+                archive.add(self.source / name, arcname=f"deleg8r-{revision}/{name}")
+        self.revision_file.write_text(json.dumps({"sha": revision}))
+        return revision
 
     def install(self, *flags):
         return self.run_command("sh", "-s", "--", *flags, input=(SOURCE / "install.sh").read_text())
@@ -69,8 +72,8 @@ class InstallTest(unittest.TestCase):
         before = db.read_bytes()
         custom = self.state / "models.json"
         custom.write_text("{}\n")
-        (self.clone / "README.md").write_text("Updated fixture\n")
-        updated = self.commit("Update fixture")
+        (self.source / "README.md").write_text("Updated fixture\n")
+        updated = self.publish("Update fixture")
         # The installed launcher retains its paths when update is called from an ordinary shell.
         self.env.pop("DELEG8R_INSTALL_DIR")
         self.env.pop("DELEG8R_BIN_DIR")
@@ -79,11 +82,24 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(db.read_bytes(), before)
         self.assertEqual(custom.read_text(), "{}\n")
 
-        (self.clone / "models.py").write_text("broken syntax =\n")
-        self.commit("Broken release")
+        (self.source / "models.py").write_text("broken syntax =\n")
+        self.publish("Broken release")
         failed = self.run_command(self.launcher, "update", check=False)
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(self.run_command(self.launcher, "version").stdout.strip(), updated)
+
+    def test_discovers_versioned_python_without_git(self):
+        commands = Path(self.env["HOME"]) / "commands"
+        commands.mkdir()
+        for command in ("sh", "curl", "mktemp", "rm"):
+            (commands / command).symlink_to(shutil.which(command))
+        unsupported = commands / "python3"
+        unsupported.write_text("#!/bin/sh\nexit 1\n")
+        unsupported.chmod(0o755)
+        (commands / "python3.10").symlink_to(self.env.pop("DELEG8R_PYTHON"))
+        self.env["PATH"] = str(commands)
+        self.install("--no-setup")
+        self.assertEqual(self.run_command(self.launcher, "version").stdout.strip(), self.original)
 
     @unittest.skipUnless(shutil.which("claude") and shutil.which("codex"), "needs both real client CLIs")
     def test_setup_preserves_configuration_and_is_idempotent(self):
