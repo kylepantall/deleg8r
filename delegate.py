@@ -383,15 +383,19 @@ def serve(store, config, client):
             print(json.dumps(response, ensure_ascii=False), flush=True)
 
 
-def configuration(client, db, models):
-    base = [sys.executable, str(Path(__file__).resolve())]
-    options = ["--client", client, "--db", str(db), "--models", str(models)]
-    hook = {"hooks": {"UserPromptSubmit": [{"hooks": [{
+def hook_configuration(base, options):
+    return {"UserPromptSubmit": [{"hooks": [{
         "type": "command", "command": shlex.join([*base, "hook", *options]), "timeout": 130,
     }]}], "PreToolUse": [{
         "matcher": "^(Edit|Write|MultiEdit|NotebookEdit|apply_patch)$",
         "hooks": [{"type": "command", "command": shlex.join([*base, "pre-tool", *options]), "timeout": 5}],
-    }]}}
+    }]}
+
+
+def configuration(client, db, models):
+    base = [sys.executable, str(Path(__file__).resolve())]
+    options = ["--client", client, "--db", str(db), "--models", str(models)]
+    hook = {"hooks": hook_configuration(base, options)}
     args = [*base[1:], "serve", *options]
     if client == "claude":
         print("# Merge into .claude/settings.local.json")

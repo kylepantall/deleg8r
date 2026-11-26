@@ -1,10 +1,29 @@
-# Task delegation MCP
+# deleg8r
 
-A local stdio MCP and project hooks for Claude Code and Codex. Requires Python 3.11+, SQLite with FTS5, and the relevant signed-in coding CLI on PATH. The hook commands target POSIX shells.
+A local stdio MCP and hooks for Claude Code and Codex. Requires a POSIX shell, Git, Python 3.11+, SQLite with FTS5, and the relevant signed-in coding CLI on PATH.
 
-## Set up a project
+## Install and update
 
-Run these commands from this directory. Set the database path to an absolute path in a private, writable state directory. Each client needs the same database path in its hook and MCP settings.
+```sh
+curl -fsSL https://raw.githubusercontent.com/kylepantall/deleg8ter/main/install.sh | sh
+```
+
+This installs `deleg8r` to `~/.local/bin` and configures the MCP and hooks at user scope for Claude Code and Codex when their CLIs are present. Restart the clients. Review and trust the new Codex hooks in `/hooks` or the desktop hook settings.
+
+If you prefer project-only configuration, append `-s -- --no-setup` to the `sh` command and use the project setup below. You can configure a client later with `deleg8r setup --client claude` or `deleg8r setup --client codex`. Setup preserves other MCP servers and hooks and reports a conflict if the target MCP name already points to a different command.
+
+```sh
+deleg8r update
+deleg8r version
+```
+
+`update` fetches the current revision of `main` and switches the launcher to it after validation. Your database, model overrides, and client settings stay in place. Restart active clients to reload the MCP process. If `deleg8r` is missing from PATH, run `~/.local/bin/deleg8r` directly or add `~/.local/bin` to PATH.
+
+Install files and SQLite state are stored in `${XDG_DATA_HOME:-$HOME/.local/share}/deleg8r`. You can place your own `models.json` there to override the bundled model and timeout settings.
+
+## Set up a single project manually
+
+From a source checkout, run these commands. Set the database path to an absolute path in a private, writable state directory. Each client needs the same database path in its hook and MCP settings.
 
 ```sh
 python3 delegate.py config --client claude --db /absolute/private/path/delegation.sqlite3
@@ -13,7 +32,7 @@ python3 delegate.py config --client codex --db /absolute/private/path/delegation
 
 Merge the two snippets for each client into the project files named in the output. Keep any existing settings. Restart the coding client and approve the project MCP server or review the Codex hooks as prompted. The generated Codex config enables the hooks feature. Verify the MCP server is available before using its edit hook. The code and configuration generator support project-specific setups without modifying global settings.
 
-Model names, effort and deadlines are in [models.json](models.json). Generate both snippets with `--models /absolute/path/models.json` to use an override. The adapter reuses the signed-in CLI. A triage timeout leaves the host free to choose its route. Claude gets a configured output-token ceiling. Codex triage uses short input, low effort, a small structured response and a deadline.
+Default model names, effort and deadlines are in [models.json](models.json). For manual setup, generate both snippets with `--models /absolute/path/models.json` to use an override. The adapter reuses the signed-in CLI. A triage timeout leaves the host free to choose its route. Claude gets a configured output-token ceiling. Codex triage uses short input, low effort, a small structured response and a deadline.
 
 ## How a request flows
 
@@ -33,7 +52,7 @@ When requirements change, revise the plan. Existing matrix rows carry forward un
 ## Verify locally
 
 ```sh
-python3 test_flow.py
+python3 -m unittest
 ```
 
-The tests run both generated client configurations through the real hook commands and stdio server with deterministic CLI model fixtures. They exercise direct routing, native-edit hook decisions, grouped test evidence, stale snapshots, steering, and model-call counts. Live model availability and production latency depend on the host environment and selected models.
+The tests run both generated client configurations through the hook commands and stdio server with deterministic CLI model fixtures. They exercise direct routing, native-edit hook decisions, grouped test evidence, stale snapshots, steering, and model-call counts. Installer tests cover upgrades, rollback on invalid source, state preservation, and idempotent setup against the real client CLIs when available. Live model availability and production latency depend on the host environment and selected models.
