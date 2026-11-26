@@ -29,9 +29,11 @@ deleg8r monitor
 deleg8r monitor --tail 50 --once
 ```
 
-`stats` prints terminal bar charts for prompt routes, task tiers and status, clients, worker modes, and reported agent names. Existing tasks are included. Prompt route counts start when the updated hooks run.
+`stats` opens a dashboard with bar charts for prompt routes, task tiers and status, clients, worker modes, and reported agent names. Use Left/Right, Tab, or 1–6 to switch charts, Up/Down to scroll, and R to reload. Existing tasks are included. Prompt route counts start when the updated hooks run.
 
-`monitor` shows recent routes, plans, revisions, and worker handoffs, then follows new events until Ctrl-C. `--tail 0` shows only new events and `--once` prints history and exits. Both commands accept `--db /absolute/path/state.sqlite3` for project-only setups. Restart active clients after updating so their MCP process can record new events.
+`monitor` shows a live timeline of routes, plans, revisions, and worker handoffs. Use Up/Down to inspect events, End to return to the latest event, Space to pause or resume, and F to cycle event filters. Both views quit with Q.
+
+Both commands use plain text when piped or with `--plain`. For the monitor, `--tail 0` shows only new events and `--once` prints history and exits. Both commands accept `--db /absolute/path/state.sqlite3` for project-only setups. Restart active clients after updating so their MCP process can record new events.
 
 Worker handoffs appear when the native host calls `report`. The host can send the real worker name as `agent_name` when reporting `running`, and later reports for the step inherit it. The monitor shows `agent=unreported` when no name was supplied. It displays activity metadata without including prompts, worker briefs, or report evidence.
 

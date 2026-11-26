@@ -1,21 +1,27 @@
 """Installer lifecycle checks with disposable source archives and client settings."""
 
+import errno
+import fcntl
 import hashlib
 import json
 import os
 import shutil
 import selectors
 import sqlite3
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import termios
+import time
 import tomllib
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 from delegate import call_tool
-from installer import FILES
+from installer import FILES, curses
 from store import Store
 
 
@@ -184,6 +190,80 @@ class InstallTest(unittest.TestCase):
         output = self.run_command(self.launcher, "monitor", "--once", "--tail", "1").stdout
         self.assertEqual(len(output.splitlines()), 1)
         self.assertIn("done", output)
+
+    @contextmanager
+    def terminal(self, *arguments):
+        master, slave = os.openpty()
+        try:
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+            env = dict(self.env, TERM="xterm-256color", LC_ALL="en_US.UTF-8")
+            with subprocess.Popen([self.launcher, *arguments], env=env, stdin=slave, stdout=slave,
+                                  stderr=slave) as process:
+                os.close(slave)
+                slave = None
+                try:
+                    yield master, process
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
+        finally:
+            if slave is not None:
+                os.close(slave)
+            os.close(master)
+
+    def expect_terminal(self, master, marker):
+        output = b""
+        end = time.monotonic() + 5
+        with selectors.DefaultSelector() as selector:
+            selector.register(master, selectors.EVENT_READ)
+            while marker not in output and selector.select(max(0, end - time.monotonic())):
+                try:
+                    output += os.read(master, 65536)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    break
+                if time.monotonic() >= end:
+                    break
+        self.assertIn(marker, output)
+
+    @unittest.skipUnless(curses, "needs curses")
+    def test_interactive_activity_dashboards(self):
+        self.install("--no-setup")
+        store = Store(self.state / "state.sqlite3")
+        self.addCleanup(store.db.close)
+        store.set_prompt_gate("test", "turn", True, client="codex", route="focused")
+        task = store.create_task("test", "codex", "focused", {
+            "steps": [{"id": "implement", "mode": "write", "needs": []}],
+        })
+        with self.terminal("stats") as (master, process):
+            self.expect_terminal(master, "█".encode())
+            os.write(master, b"6")
+            self.expect_terminal(master, b"Current steps by reported agent")
+            os.write(master, b"q")
+            self.expect_terminal(master, b"?1049l")
+            self.assertEqual(process.wait(timeout=5), 0)
+        with self.terminal("monitor") as (master, process):
+            self.expect_terminal(master, b"Timeline")
+            self.report_activity(store, task, "running", agent_name="Dev Agent")
+            self.expect_terminal(master, b"Dev Agent")
+            os.write(master, b" ")
+            self.expect_terminal(master, b"PAUSED")
+            self.report_activity(store, task, "done")
+            os.write(master, b" ")
+            self.expect_terminal(master, b"done")
+            os.write(master, b"f")
+            self.expect_terminal(master, b"route")
+            os.write(master, b"q")
+            self.expect_terminal(master, b"?1049l")
+            self.assertEqual(process.wait(timeout=5), 0)
+        with self.terminal("stats", "--plain") as (master, process):
+            self.expect_terminal(master, b"Deleg8r activity (1 tasks)")
+            self.assertEqual(process.wait(timeout=5), 0)
+        with self.terminal("monitor", "--once") as (master, process):
+            self.expect_terminal(master, b"agent=Dev Agent")
+            self.assertEqual(process.wait(timeout=5), 0)
 
     def test_activity_cli_opens_legacy_database(self):
         self.install("--no-setup")

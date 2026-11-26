@@ -13,13 +13,18 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 
 from delegate import TRIAGE, hook_configuration
 from models import ROUTE, ask, model_settings
 from store import Store
+
+try:
+    import curses
+except ImportError:
+    curses = None
 
 
 APP = "deleg8r"
@@ -415,7 +420,6 @@ def doctor(root, bin_dir, release, client, live):
     return healthy
 
 
-
 def terminal_text(value):
     return "".join(character if character.isprintable() else "?" for character in value)
 
@@ -431,7 +435,7 @@ def chart(title, counts):
         print(f"  {terminal_text(label):<18} {count:>6}  {'#' * length}")
 
 
-def stats(path):
+def activity_counts(path):
     task_states = Counter({"completed": 0})
     tiers, clients, modes, agents = Counter(), Counter(), Counter(), Counter()
     with contextlib.closing(Store(path).db) as db:
@@ -463,13 +467,102 @@ def stats(path):
             else:
                 task_states["in progress"] += 1
 
-    print(f"Deleg8r activity ({sum(tiers.values())} tasks)")
-    chart("Recorded prompt routes", routes)
-    chart("Task tiers", tiers)
-    chart("Task status", task_states)
-    chart("Tasks by client", clients)
-    chart("Current steps by mode", modes)
-    chart("Current steps by reported agent", agents)
+    return sum(tiers.values()), (
+        ("Recorded prompt routes", routes), ("Task tiers", tiers),
+        ("Task status", task_states), ("Tasks by client", clients),
+        ("Current steps by mode", modes), ("Current steps by reported agent", agents),
+    )
+
+
+def terminal_dashboard(view, *args):
+    if not curses or not sys.stdin.isatty() or not sys.stdout.isatty() or os.environ.get("TERM") in (None, "", "dumb"):
+        return False
+    try:
+        curses.wrapper(view, *args)
+    except curses.error:
+        return False
+    except KeyboardInterrupt:
+        pass
+    return True
+
+
+def dashboard_colors():
+    if not curses.has_colors():
+        return curses.A_BOLD, curses.A_NORMAL, curses.A_BOLD, curses.A_NORMAL
+    curses.start_color()
+    background = curses.COLOR_BLACK
+    try:
+        curses.use_default_colors()
+        background = -1
+    except curses.error:
+        pass
+    for number, color in enumerate((curses.COLOR_CYAN, curses.COLOR_BLUE, curses.COLOR_GREEN, curses.COLOR_YELLOW), 1):
+        curses.init_pair(number, color, background)
+    return tuple(curses.color_pair(number) | curses.A_BOLD for number in range(1, 5))
+
+
+def screen_line(screen, row, text, style=0, column=0):
+    height, width = screen.getmaxyx()
+    if 0 <= row < height and column < width - 1:
+        try:
+            screen.addnstr(row, column, str(text), width - column - 1, style)
+        except curses.error:
+            pass
+
+
+def stats_dashboard(screen, path):
+    accents = dashboard_colors()
+    total, charts = activity_counts(path)
+    tabs = "Routes  Tiers  Status  Clients  Modes  Agents".split()
+    selected = offset = 0
+    while True:
+        height, width = screen.getmaxyx()
+        screen.erase()
+        screen_line(screen, 0, f" DELEG8R / STATS   {total} tasks", accents[0])
+        position = 1
+        for index, tab in enumerate(tabs):
+            label = f" {index + 1}:{tab} "
+            screen_line(screen, 2, label, curses.A_REVERSE if index == selected else accents[0], position)
+            position += len(label) + 1
+        title, counts = charts[selected]
+        screen_line(screen, 4, title, curses.A_BOLD, 1)
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        visible = max(1, height - 8)
+        offset = min(offset, max(0, len(ordered) - visible))
+        peak = max(counts.values(), default=0)
+        bar_width = max(0, min(42, width - 35))
+        if not ordered:
+            screen_line(screen, 6, "No activity for this view", column=1)
+        for row, (label, count) in enumerate(ordered[offset:offset + visible], 6):
+            screen_line(screen, row, f"{terminal_text(label)[:22]:22} {count:>6}", column=1)
+            if peak and count and bar_width:
+                length = max(1, round(bar_width * count / peak))
+                screen_line(screen, row, "█" * length, accents[selected % len(accents)], 32)
+        screen_line(screen, height - 1, " ←/→ Tabs   1–6 Jump   ↑/↓ Scroll   r Reload   q Quit ", curses.A_REVERSE)
+        key = screen.getch()
+        if key in (ord("q"), 27):
+            return
+        if key in (curses.KEY_RIGHT, 9, curses.KEY_LEFT) or ord("1") <= key <= ord("6"):
+            if ord("1") <= key <= ord("6"):
+                selected = key - ord("1")
+            else:
+                selected = (selected + (-1 if key == curses.KEY_LEFT else 1)) % len(charts)
+            offset = 0
+        elif key == curses.KEY_DOWN:
+            offset += 1
+        elif key == curses.KEY_UP:
+            offset = max(0, offset - 1)
+        elif key == ord("r"):
+            total, charts = activity_counts(path)
+
+
+def stats(path, plain=False):
+    if not plain and terminal_dashboard(stats_dashboard, path):
+        return
+    total, charts = activity_counts(path)
+    print(f"Deleg8r activity ({total} tasks)")
+    for title, counts in charts:
+        chart(title, counts)
 
 
 def print_event(event):
@@ -483,15 +576,87 @@ def print_event(event):
     print("  ".join(map(terminal_text, parts)), flush=True)
 
 
-def monitor(path, tail, once):
+def recent_events(db, tail, cursor):
+    newest = db.execute("SELECT coalesce(max(id),0) FROM activity").fetchone()[0]
+    rows = db.execute(
+        "SELECT * FROM activity WHERE id>? AND id<=? ORDER BY id DESC LIMIT ?", (cursor, newest, tail)
+    ).fetchall()
+    return reversed(rows), newest
+
+
+EVENT_STYLES = {"route": ("●", 0), "plan": ("◆", 1), "revise": ("◇", 3), "step": ("■", 2)}
+
+
+def monitor_dashboard(screen, db, tail):
+    accents = dashboard_colors()
+    recent, cursor = recent_events(db, tail, 0)
+    events = deque(recent, maxlen=1000)
+    filters = ("all", *EVENT_STYLES)
+    selected_filter = 0
+    selected_id = None
+    paused = False
+    screen.timeout(500)
+    while True:
+        if not paused:
+            recent, cursor = recent_events(db, events.maxlen, cursor)
+            events.extend(recent)
+        filtered = [event for event in events if filters[selected_filter] in ("all", event["kind"])]
+        selected = next((index for index, event in enumerate(filtered) if event["id"] == selected_id),
+                        len(filtered) - 1)
+        height, width = screen.getmaxyx()
+        visible = max(1, height - 9)
+        first = max(0, min(selected, len(filtered) - visible))
+        screen.erase()
+        state = "PAUSED" if paused else "LIVE"
+        screen_line(screen, 0, f" DELEG8R / MONITOR   {state}   Filter: {filters[selected_filter]}   {len(filtered)} events",
+                    accents[3 if paused else 2])
+        screen_line(screen, 2, "Timeline", curses.A_BOLD, 1)
+        for column, event in enumerate(filtered[-max(1, width - 13):], 11):
+            symbol, color = EVENT_STYLES[event["kind"]]
+            screen_line(screen, 2, symbol, accents[color], column)
+        screen_line(screen, 3, "● Route   ◆ Plan   ◇ Revision   ■ Step", column=1)
+        for row, event in enumerate(filtered[first:first + visible], 5):
+            symbol, color = EVENT_STYLES[event["kind"]]
+            timestamp = datetime.fromtimestamp(event["created"]).strftime("%H:%M:%S")
+            subject = event["step_id"] or (event["task_id"] or "")[:8]
+            agent = (event["agent_name"] or "unreported") if event["step_id"] else ""
+            line = f"{symbol} {timestamp}  {event['client']:7} {event['kind']:6} {event['detail']:11} {subject:16} {agent}"
+            style = accents[color] | (curses.A_REVERSE if row - 5 + first == selected else 0)
+            screen_line(screen, row, terminal_text(line), style, 1)
+        if filtered:
+            event = filtered[selected]
+            identity = f"{event['client']}  {event['kind']} {event['detail']}"
+            if event["step_id"]:
+                identity += f"  step={event['step_id']}  agent={event['agent_name'] or 'unreported'}"
+            screen_line(screen, height - 4, terminal_text(identity), curses.A_BOLD, 1)
+            if event["task_id"]:
+                screen_line(screen, height - 3, f"Task {event['task_id']}  revision {event['revision']}", column=1)
+        else:
+            screen_line(screen, 5, "Waiting for matching activity…", column=1)
+        screen_line(screen, height - 1, " ↑/↓ Inspect   End Latest   Space Pause   f Filter   q Quit ", curses.A_REVERSE)
+        key = screen.getch()
+        if key in (ord("q"), 27):
+            return
+        if key == ord(" "):
+            paused = not paused
+        elif key == ord("f"):
+            selected_filter = (selected_filter + 1) % len(filters)
+            selected_id = None
+        elif key == curses.KEY_END:
+            selected_id = None
+        elif filtered and key in (curses.KEY_UP, curses.KEY_DOWN):
+            index = max(0, min(len(filtered) - 1, selected + (-1 if key == curses.KEY_UP else 1)))
+            selected_id = filtered[index]["id"]
+
+
+def monitor(path, tail, once, plain=False):
     if not 0 <= tail <= 1000:
         raise ValueError("--tail must be between 0 and 1000")
     with contextlib.closing(Store(path).db) as db:
-        cursor = db.execute("SELECT coalesce(max(id),0) FROM activity").fetchone()[0]
-        recent = db.execute(
-            "SELECT * FROM activity WHERE id<=? ORDER BY id DESC LIMIT ?", (cursor, tail)
-        ).fetchall()
-        for event in reversed(recent):
+        if not once and not plain and terminal_dashboard(monitor_dashboard, db, tail):
+            return
+        recent, cursor = recent_events(db, tail, 0)
+        for event in recent:
             print_event(event)
         if once:
             return
@@ -528,6 +693,7 @@ def main():
     watch = commands.add_parser("monitor", help="Watch delegation events and agent handoffs")
     for view in (statistics, watch):
         view.add_argument("--db", type=Path, help="Use a project-specific delegation database")
+        view.add_argument("--plain", action="store_true", help="Use plain-text output in a terminal")
     watch.add_argument("--tail", type=int, default=20, help="Recent events to show before following (default: 20)")
     watch.add_argument("--once", action="store_true", help="Print recent events and exit")
     configuration = commands.add_parser("setup", help="Alias for hook")
@@ -573,9 +739,9 @@ def main():
     elif args.action in ("stats", "monitor"):
         database = args.db.expanduser() if args.db else root / "state.sqlite3"
         if args.action == "stats":
-            stats(database)
+            stats(database, args.plain)
         else:
-            monitor(database, args.tail, args.once)
+            monitor(database, args.tail, args.once, args.plain)
     elif args.action == "setup":
         setup(root, bin_dir, args.client)
     elif args.action == "hook" and not args.client:
