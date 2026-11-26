@@ -1,0 +1,12 @@
+{
+  "claude": {
+    "triage": {"model": "haiku", "effort": "low", "seconds": 12},
+    "focused": {"model": "sonnet", "effort": "low", "seconds": 60},
+    "complex": {"model": "opus", "effort": "medium", "seconds": 90}
+  },
+  "codex": {
+    "triage": {"model": "gpt-6-luna", "effort": "low", "seconds": 12},
+    "focused": {"model": "gpt-6.1-sol", "effort": "low", "seconds": 60},
+    "complex": {"model": "gpt-6.2-astra", "effort": "medium", "seconds": 90}
+  }
+}
