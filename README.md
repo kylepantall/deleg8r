@@ -8,7 +8,7 @@ A local stdio MCP and hooks for Claude Code and Codex. Requires a POSIX shell, c
 curl -fsSL https://raw.githubusercontent.com/kylepantall/deleg8r/main/install.sh | sh
 ```
 
-This installs `deleg8r` to `~/.local/bin` and configures the MCP and hooks at user scope for Claude Code and Codex when their CLIs are present. The installer downloads a source archive and checks versioned Python commands when `python3` is unavailable or too old. Restart the clients. Review and trust the new Codex hooks in `/hooks` or the desktop hook settings.
+This installs `deleg8r` to `~/.local/bin` and configures the MCP and hooks at user scope for Claude Code and Codex when their CLIs are present. The installer adds the launcher directory to the startup files for your default shell (Zsh, Bash, Fish, or a POSIX shell such as sh, dash, or ksh). Open a new terminal to use `deleg8r` from PATH. The installer downloads a source archive and checks versioned Python commands when `python3` is unavailable or too old. Restart the clients. Review and trust the new Codex hooks in `/hooks` or the desktop hook settings.
 
 If you prefer project-only configuration, append `-s -- --no-setup` to the `sh` command and use the project setup below. The installer preserves other MCP servers and hooks and reports a conflict if the target MCP name already points to a different command.
 
@@ -17,9 +17,23 @@ deleg8r update
 deleg8r version
 ```
 
-`update` fetches the current revision of `main` and switches the launcher to it after validation. Your database, model overrides, and client settings stay in place. Restart active clients to reload the MCP process. If `deleg8r` is missing from PATH, run `~/.local/bin/deleg8r` directly or add `~/.local/bin` to PATH.
+`update` fetches the current revision of `main` and switches the launcher to it after validation. Your database, model overrides, and client settings stay in place. Restart active clients to reload the MCP process. Updates also configure PATH. If you need to run the update before opening a new terminal, use `~/.local/bin/deleg8r update`.
 
 Install files and SQLite state are stored in `${XDG_DATA_HOME:-$HOME/.local/share}/deleg8r`. You can place your own `models.json` there to override the bundled model and timeout settings.
+
+## View delegation activity
+
+```sh
+deleg8r stats
+deleg8r monitor
+deleg8r monitor --tail 50 --once
+```
+
+`stats` prints terminal bar charts for prompt routes, task tiers and status, clients, worker modes, and reported agent names. Existing tasks are included. Prompt route counts start when the updated hooks run.
+
+`monitor` shows recent routes, plans, revisions, and worker handoffs, then follows new events until Ctrl-C. `--tail 0` shows only new events and `--once` prints history and exits. Both commands accept `--db /absolute/path/state.sqlite3` for project-only setups. Restart active clients after updating so their MCP process can record new events.
+
+Worker handoffs appear when the native host calls `report`. The host can send the real worker name as `agent_name` when reporting `running`, and later reports for the step inherit it. The monitor shows `agent=unreported` when no name was supplied. It displays activity metadata without including prompts, worker briefs, or report evidence.
 
 ## Connect, disconnect, or diagnose a client
 

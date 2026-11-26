@@ -47,6 +47,17 @@ CREATE TABLE IF NOT EXISTS verification (
     task_id TEXT PRIMARY KEY,
     results TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS activity (
+    id INTEGER PRIMARY KEY,
+    created REAL NOT NULL,
+    kind TEXT NOT NULL,
+    client TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    task_id TEXT,
+    revision INTEGER,
+    step_id TEXT,
+    agent_name TEXT
+);
 CREATE TABLE IF NOT EXISTS prompt_gates (
     thread TEXT PRIMARY KEY,
     turn TEXT NOT NULL,
@@ -108,7 +119,14 @@ class Store:
             self.db.execute("DELETE FROM routes WHERE created<=?", (now - 3600,))
             self.db.execute("INSERT OR REPLACE INTO routes VALUES (?,?,?)", (fingerprint, json.dumps(complexity), now))
 
-    def set_prompt_gate(self, thread, turn, required):
+    def record_activity(self, kind, client, detail, *, task_id=None, revision=None, step_id=None, agent_name=None):
+        self.db.execute(
+            """INSERT INTO activity (created,kind,client,detail,task_id,revision,step_id,agent_name)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (time.time(), kind, client, detail, task_id, revision, step_id, agent_name),
+        )
+
+    def set_prompt_gate(self, thread, turn, required, *, client, route):
         with self.db:
             if required:
                 self.db.execute(
@@ -120,6 +138,7 @@ class Store:
                 )
             else:
                 self.db.execute("DELETE FROM prompt_gates WHERE thread=?", (thread,))
+            self.record_activity("route", client, route)
 
     def unlock_prompt(self, thread, turn, task_id):
         if turn:
@@ -155,6 +174,7 @@ class Store:
                 (task_id, thread, client, tier, 1, 1, json.dumps(plan), "{}"),
             )
             self.unlock_prompt(thread, turn, task_id)
+            self.record_activity("plan", client, tier, task_id=task_id, revision=1)
         return self.get_task(thread, client, task_id)
 
     def revise(self, previous, tier, plan, turn=None):
@@ -173,6 +193,8 @@ class Store:
             }
             self.save_tests(previous["id"], retained)
             self.unlock_prompt(previous["thread"], turn, previous["id"])
+            self.record_activity("revise", previous["client"], tier,
+                                 task_id=previous["id"], revision=previous["revision"] + 1)
         return self.get_task(previous["thread"], previous["client"], previous["id"])
 
     def save_tests(self, task_id, results):
@@ -206,7 +228,7 @@ class Store:
                 task["generation"] += 1
             return task
 
-    def report(self, thread, client, task_id, revision, step_id, status, evidence, tests=()):
+    def report(self, thread, client, task_id, revision, step_id, status, evidence, tests=(), agent_name=None):
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             task = self.get_task(thread, client, task_id)
@@ -218,6 +240,9 @@ class Store:
             reports = task["reports"]
             update = {"status": status, "evidence": evidence}
             previous = reports.get(step_id, {})
+            agent_name = agent_name or previous.get("agent_name")
+            if agent_name:
+                update["agent_name"] = agent_name
             merged = self.merge_tests(task, tests)
             if previous == update and task["tests"] == merged:
                 return task
@@ -233,4 +258,7 @@ class Store:
                 (json.dumps(reports), task_id),
             )
             self.save_tests(task_id, merged)
+            if (status, agent_name) != (previous.get("status"), previous.get("agent_name")):
+                self.record_activity("step", client, status, task_id=task_id, revision=revision,
+                                     step_id=step_id, agent_name=agent_name)
         return self.get_task(thread, client, task_id)

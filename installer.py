@@ -12,10 +12,14 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 from delegate import TRIAGE, hook_configuration
 from models import ROUTE, ask, model_settings
+from store import Store
 
 
 APP = "deleg8r"
@@ -46,6 +50,58 @@ def atomic_text(path, content, mode=0o600):
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def configure_shell_path(bin_dir):
+    home = Path.home()
+    shell = Path(os.environ.get("SHELL") or "/bin/sh").name
+    directory = str(bin_dir)
+    if any(character in directory for character in ":\r\n"):
+        raise ValueError("The launcher directory cannot contain a colon or newline")
+
+    if shell == "zsh":
+        profiles = [Path(os.environ.get("ZDOTDIR") or home) / ".zshrc"]
+    elif shell == "bash":
+        login_profiles = [home / name for name in (".bash_profile", ".bash_login", ".profile")]
+        login = next((path for path in login_profiles if path.is_file()), home / ".bash_profile")
+        profiles = [home / ".bashrc", login]
+    elif shell == "fish":
+        config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+        profiles = [config / "fish" / "config.fish"]
+    elif shell in ("sh", "dash", "ksh"):
+        profiles = [home / ".profile"]
+    else:
+        raise ValueError(f"Automatic PATH setup is unavailable for {shell}")
+
+    if shell == "fish":
+        quoted = "'" + directory.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        commands = (
+            f"if not contains -- {quoted} $PATH\n"
+            f"    set -gx PATH {quoted} $PATH\n"
+            "end\n"
+        )
+    else:
+        quoted = shlex.quote(directory)
+        commands = (
+            'case ":${PATH-}:" in\n'
+            f'    *:{quoted}:*) ;;\n'
+            f'    *) export PATH={quoted}${{PATH:+":$PATH"}} ;;\n'
+            'esac\n'
+        )
+
+    start = "# >>> deleg8r PATH >>>"
+    end = "# <<< deleg8r PATH <<<"
+    block = f"{start}\n{commands}{end}\n"
+    managed = re.compile(rf"^{re.escape(start)}\n.*?^{re.escape(end)}(?:\n|$)", re.M | re.S)
+    for profile in profiles:
+        existing = profile.read_bytes().decode("utf-8") if profile.exists() else ""
+        if managed.search(existing):
+            updated = managed.sub(lambda _: block, existing, count=1)
+        else:
+            separator = "\n" if existing and not existing.endswith("\n") else ""
+            updated = existing + separator + block
+        if updated != existing:
+            atomic_text(profile, updated)
 
 
 def read_json(path):
@@ -359,6 +415,101 @@ def doctor(root, bin_dir, release, client, live):
     return healthy
 
 
+
+def terminal_text(value):
+    return "".join(character if character.isprintable() else "?" for character in value)
+
+
+def chart(title, counts):
+    print(f"\n{title}")
+    if not counts:
+        print("  No activity")
+        return
+    peak = max(counts.values(), default=0)
+    for label, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        length = max(1, round(24 * count / peak)) if count else 0
+        print(f"  {terminal_text(label):<18} {count:>6}  {'#' * length}")
+
+
+def stats(path):
+    task_states = Counter({"completed": 0})
+    tiers, clients, modes, agents = Counter(), Counter(), Counter(), Counter()
+    with contextlib.closing(Store(path).db) as db:
+        routes = Counter({
+            row["detail"]: row["total"] for row in db.execute(
+                "SELECT detail, count(*) AS total FROM activity WHERE kind='route' GROUP BY detail"
+            )
+        })
+        for row in db.execute("SELECT client,tier,plan,reports FROM tasks"):
+            tiers[row["tier"]] += 1
+            clients[row["client"]] += 1
+            steps = json.loads(row["plan"])["steps"]
+            reports = json.loads(row["reports"])
+            states = []
+            for step in steps:
+                modes[step["mode"]] += 1
+                report = reports.get(step["id"], {})
+                states.append(report.get("status", "pending"))
+                if report.get("agent_name"):
+                    agents[report["agent_name"]] += 1
+            if not states:
+                task_states["host-only"] += 1
+            elif all(state == "done" for state in states):
+                task_states["completed"] += 1
+            elif "blocked" in states:
+                task_states["blocked"] += 1
+            elif all(state == "pending" for state in states):
+                task_states["planned"] += 1
+            else:
+                task_states["in progress"] += 1
+
+    print(f"Deleg8r activity ({sum(tiers.values())} tasks)")
+    chart("Recorded prompt routes", routes)
+    chart("Task tiers", tiers)
+    chart("Task status", task_states)
+    chart("Tasks by client", clients)
+    chart("Current steps by mode", modes)
+    chart("Current steps by reported agent", agents)
+
+
+def print_event(event):
+    stamp = datetime.fromtimestamp(event["created"]).astimezone().isoformat(timespec="seconds")
+    parts = [stamp, event["client"], event["kind"], event["detail"]]
+    if event["task_id"]:
+        parts.extend((event["task_id"], f"r{event['revision']}"))
+    if event["step_id"]:
+        agent = event["agent_name"] or "unreported"
+        parts.extend((event["step_id"], f"agent={agent}"))
+    print("  ".join(map(terminal_text, parts)), flush=True)
+
+
+def monitor(path, tail, once):
+    if not 0 <= tail <= 1000:
+        raise ValueError("--tail must be between 0 and 1000")
+    with contextlib.closing(Store(path).db) as db:
+        cursor = db.execute("SELECT coalesce(max(id),0) FROM activity").fetchone()[0]
+        recent = db.execute(
+            "SELECT * FROM activity WHERE id<=? ORDER BY id DESC LIMIT ?", (cursor, tail)
+        ).fetchall()
+        for event in reversed(recent):
+            print_event(event)
+        if once:
+            return
+        print("Watching Deleg8r activity. Press Ctrl-C to stop.", flush=True)
+        try:
+            while True:
+                batch = db.execute(
+                    "SELECT * FROM activity WHERE id>? ORDER BY id LIMIT 200", (cursor,)
+                ).fetchall()
+                for event in batch:
+                    print_event(event)
+                    cursor = event["id"]
+                if len(batch) < 200:
+                    time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+
+
 def main():
     if sys.version_info < (3, 8):
         raise ValueError("Python 3.8 or newer is required")
@@ -373,6 +524,12 @@ def main():
     install.add_argument("--update", action="store_true")
     commands.add_parser("update", help="Install the latest version from GitHub")
     commands.add_parser("version", help="Show the installed source revision")
+    statistics = commands.add_parser("stats", help="Show terminal charts of delegation activity")
+    watch = commands.add_parser("monitor", help="Watch delegation events and agent handoffs")
+    for view in (statistics, watch):
+        view.add_argument("--db", type=Path, help="Use a project-specific delegation database")
+    watch.add_argument("--tail", type=int, default=20, help="Recent events to show before following (default: 20)")
+    watch.add_argument("--once", action="store_true", help="Print recent events and exit")
     configuration = commands.add_parser("setup", help="Alias for hook")
     configuration.add_argument("--client", choices=("auto", "claude", "codex"), default="auto")
     hook = commands.add_parser("hook", help="Connect Claude Code, Codex, or both")
@@ -398,16 +555,27 @@ def main():
         revision = install_release(args.source, revision, root, bin_dir)
         launcher = bin_dir / APP
         print(f"{'Updated' if args.update else 'Installed'} deleg8r {revision[:12]} at {launcher}", flush=True)
+        try:
+            configure_shell_path(bin_dir)
+        except (OSError, ValueError) as error:
+            print(f"deleg8r: {error}. Add {bin_dir} to PATH or run {launcher} directly.", file=sys.stderr)
+        else:
+            if not shutil.which(APP):
+                print("Open a new terminal to use deleg8r from PATH.")
         if not args.no_setup:
             setup(root, bin_dir, "auto")
-        if not shutil.which(APP):
-            print(f"Add {bin_dir} to PATH or run {launcher} directly.")
     elif args.action == "update":
         env = dict(os.environ, DELEG8R_INSTALL_DIR=str(root), DELEG8R_BIN_DIR=str(bin_dir),
                    DELEG8R_PYTHON=sys.executable)
         os.execve("/bin/sh", ["sh", str(release / "install.sh"), "--update", "--no-setup"], env)
     elif args.action == "version":
         print((release / "revision").read_text(encoding="utf-8").strip())
+    elif args.action in ("stats", "monitor"):
+        database = args.db.expanduser() if args.db else root / "state.sqlite3"
+        if args.action == "stats":
+            stats(database)
+        else:
+            monitor(database, args.tail, args.once)
     elif args.action == "setup":
         setup(root, bin_dir, args.client)
     elif args.action == "hook" and not args.client:
@@ -429,6 +597,6 @@ if __name__ == "__main__":
     os.umask(0o077)
     try:
         main()
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
         print(f"deleg8r: {exc}", file=sys.stderr)
         sys.exit(1)

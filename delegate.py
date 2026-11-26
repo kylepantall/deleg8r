@@ -75,10 +75,10 @@ TOOLS = {
     ),
     "status": ("Return the current plan, worker reports, and dependency-ready step IDs.", object_schema(TASK)),
     "report": (
-        "Record a worker's progress and any matrix test results in the same handoff.",
+        "Record worker progress and matrix results. Pass the worker name returned by the host as agent_name.",
         object_schema({**TASK, "revision": integer(1, 1000000), "step_id": string(16),
                        "status": choice("running", "done", "blocked"), "evidence": string(550, 0),
-                       "tests": array(TEST_RESULT, 8)}, ("tests",)),
+                       "tests": array(TEST_RESULT, 8), "agent_name": string(100)}, ("tests", "agent_name")),
     ),
     "review": (
         "Bundle final test results and the delivered snapshot. Verifies required rows and asks the planner to review complex work.",
@@ -272,7 +272,7 @@ def prompt_hook(store, config, client, event):
     turn = event.get("turn_id") if client == "codex" else None
     turn = turn if isinstance(turn, str) and turn else uuid.uuid4().hex
     delegated = route in {"focused", "complex"}
-    store.set_prompt_gate(thread, turn, delegated)
+    store.set_prompt_gate(thread, turn, delegated, client=client, route=route)
     context = f"Task delegation route {route}. Main-thread memory key {thread}. Turn {turn}. "
     context += "For steering on active work, reconcile workers and call task_delegation revise with the task ID, revision and turn."
     if delegated or route == "unavailable":
@@ -283,7 +283,8 @@ def prompt_hook(store, config, client, event):
             "Pass observations with sources, hypothesis and this turn to plan or revise in one call. "
             "When triage is unavailable, decide whether delegation is worthwhile. "
             "Then launch only ready steps with fresh context when available. Give each worker its brief, "
-            "paths, relevant matrix IDs and main-thread memory key. In report include concise test outcomes "
+            "paths, relevant matrix IDs and main-thread memory key. Report running when dispatching, "
+            "with the host-returned agent name as agent_name. In report include concise test outcomes "
             "with row IDs, command/results, and a code snapshot. Send final test results and delivered "
             "snapshot in review. Only claim verified if review returns complete. "
             "Use remember for durable facts and recall for targeted context."

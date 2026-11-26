@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import shutil
+import selectors
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -12,7 +14,9 @@ import tomllib
 import unittest
 from pathlib import Path
 
+from delegate import call_tool
 from installer import FILES
+from store import Store
 
 
 SOURCE = Path(__file__).resolve().parent
@@ -22,7 +26,7 @@ class InstallTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="deleg8r test ")
         self.addCleanup(temporary.cleanup)
-        folder = Path(temporary.name)
+        folder = Path(temporary.name).resolve()
         home = folder / "home"
         home.mkdir()
         self.codex = home / "codex"
@@ -41,6 +45,8 @@ class InstallTest(unittest.TestCase):
             DELEG8R_INSTALL_DIR=str(self.state), DELEG8R_BIN_DIR=str(self.launcher.parent),
             DELEG8R_PYTHON=os.environ.get("DELEG8R_TEST_PYTHON", sys.executable), PYTHONDONTWRITEBYTECODE="1",
         )
+        self.env["SHELL"] = "/bin/sh"
+        self.env.pop("ZDOTDIR", None)
         for name in FILES:
             shutil.copy2(SOURCE / name, self.source / name)
         self.original = self.publish("Initial fixture")
@@ -87,6 +93,125 @@ class InstallTest(unittest.TestCase):
         failed = self.run_command(self.launcher, "update", check=False)
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(self.run_command(self.launcher, "version").stdout.strip(), updated)
+
+    def test_install_configures_path_in_fresh_shells(self):
+        home = Path(self.env["HOME"])
+        self.launcher = home / "bin with 'quotes' and [brackets]" / "deleg8r"
+        self.env["DELEG8R_BIN_DIR"] = str(self.launcher.parent)
+        for shell, startup, modes in (
+            ("bash", ".bash_login", ("-lic", "-ic")),
+            ("zsh", "zsh-config/.zshrc", ("-lic", "-ic")),
+            ("fish", "config/fish/config.fish", ("-lic", "-ic")),
+            ("sh", ".profile", ("-lic",)),
+        ):
+            binary = shutil.which(shell)
+            if not binary:
+                continue
+            with self.subTest(shell=shell):
+                self.env["SHELL"] = binary
+                self.env["ZDOTDIR"] = str(home / "zsh-config")
+                profile = home / startup
+                profile.parent.mkdir(parents=True, exist_ok=True)
+                original = b"# Existing user settings"
+                profile.write_bytes(original)
+                profile.chmod(0o640)
+                self.install("--no-setup")
+                configured = profile.read_bytes()
+                self.assertTrue(configured.startswith(original + b"\n"))
+                self.assertEqual(profile.stat().st_mode & 0o777, 0o640)
+                profile.write_bytes(original)
+                self.run_command(self.launcher, "update")
+                self.assertEqual(profile.read_bytes(), configured)
+                self.run_command(self.launcher, "update")
+                self.assertEqual(profile.read_bytes(), configured)
+                for mode in modes:
+                    search = "-s" if shell == "fish" else "-v"
+                    command = f"command {search} deleg8r && deleg8r version"
+                    output = self.run_command(binary, mode, command).stdout.splitlines()
+                    self.assertEqual(output, [str(self.launcher), self.original])
+
+    def report_activity(self, store, task, status, **details):
+        return call_tool(store, {}, "codex", "report", {
+            "thread": "test", "task_id": task["id"], "revision": 1,
+            "step_id": "implement", "status": status, "evidence": "private evidence", **details,
+        })
+
+    def test_stats_charts_follow_task_progress(self):
+        self.install("--no-setup")
+        initial = self.run_command(self.launcher, "stats").stdout
+        self.assertIn("0 tasks", initial)
+        self.assertRegex(initial, r"completed +0")
+        store = Store(self.state / "state.sqlite3")
+        self.addCleanup(store.db.close)
+        store.set_prompt_gate("test", "turn", True, client="codex", route="focused")
+        task = store.create_task("test", "codex", "focused", {
+            "steps": [{"id": "implement", "mode": "write", "needs": []}],
+        })
+        self.report_activity(store, task, "running", agent_name="Dev Agent")
+        self.report_activity(store, task, "done")
+        output = self.run_command(self.launcher, "stats").stdout
+        for label in ("completed", "focused", "codex", "write", "Dev Agent"):
+            self.assertRegex(output, rf"{label} +1 +#")
+        self.assertNotIn("private evidence", output)
+
+    def test_monitor_follows_reports_and_keeps_agent_names(self):
+        self.install("--no-setup")
+        database = self.state / "state.sqlite3"
+        store = Store(database)
+        self.addCleanup(store.db.close)
+        task = store.create_task("test", "codex", "focused", {
+            "steps": [{"id": "implement", "mode": "write", "needs": []}],
+        })
+        with subprocess.Popen([self.launcher, "monitor", "--tail", "0"], env=self.env,
+                              stdout=subprocess.PIPE, text=True) as monitor:
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(monitor.stdout, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(5), "Monitor did not start")
+                    self.assertIn("Watching Deleg8r activity", monitor.stdout.readline())
+                    self.report_activity(store, task, "running", agent_name="Dev Agent")
+                    self.assertTrue(selector.select(5), "Monitor did not receive the live handoff")
+                    line = monitor.stdout.readline()
+                    for value in (task["id"], "implement", "running", "agent=Dev Agent"):
+                        self.assertIn(value, line)
+                    self.assertNotIn("private evidence", line)
+                    self.report_activity(store, task, "done")
+                    self.assertTrue(selector.select(5), "Monitor did not receive completion")
+                    self.assertIn("agent=Dev Agent", monitor.stdout.readline())
+            finally:
+                monitor.terminate()
+                monitor.wait(timeout=5)
+        output = self.run_command(self.launcher, "monitor", "--once", "--tail", "1").stdout
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertIn("done", output)
+
+    def test_activity_cli_opens_legacy_database(self):
+        self.install("--no-setup")
+        database = self.state / "state.sqlite3"
+        with sqlite3.connect(database) as db:
+            db.execute("""CREATE TABLE tasks (id TEXT PRIMARY KEY, thread TEXT NOT NULL,
+                          client TEXT NOT NULL, tier TEXT NOT NULL, revision INTEGER NOT NULL,
+                          generation INTEGER NOT NULL, plan TEXT NOT NULL, reports TEXT NOT NULL)""")
+            row = (
+                "legacy", "test", "claude", "complex", 1, 2,
+                json.dumps({"steps": [{"id": "scout", "needs": [], "mode": "read"}]}),
+                json.dumps({"scout": {"status": "done", "evidence": "original"}}),
+            )
+            db.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?)", row)
+        output = self.run_command(self.launcher, "stats", "--db", database).stdout
+        for label in ("completed", "claude", "complex", "read"):
+            self.assertRegex(output, rf"{label} +1 +#")
+        self.assertEqual(self.run_command(self.launcher, "monitor", "--db", database, "--once").stdout, "")
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "status", "arguments": {"thread": "test", "task_id": "legacy"},
+        }}
+        response = self.run_command(self.launcher, "serve", "--client", "claude",
+                                    input=json.dumps(request) + "\n")
+        status = json.loads(json.loads(response.stdout)["result"]["content"][0]["text"])
+        self.assertEqual(status["plan"], json.loads(row[6]))
+        self.assertEqual(status["reports"], json.loads(row[7]))
+        self.assertEqual(db.execute("SELECT * FROM tasks").fetchone(), row)
+        db.close()
 
     def test_discovers_versioned_python_without_git(self):
         commands = Path(self.env["HOME"]) / "commands"
