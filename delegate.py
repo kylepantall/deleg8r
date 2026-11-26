@@ -9,6 +9,7 @@ import re
 import shlex
 import sqlite3
 import sys
+import time
 import uuid
 from pathlib import Path, PurePosixPath
 
@@ -55,14 +56,20 @@ PLAN_INPUT = {
     "request": string(6000), "tier": TIER, "memory_query": string(240, 0),
     "hypothesis": string(220), "findings": array(FINDING, 8, 1), "turn": string(160),
 }
+TOKEN_FIELDS = ("input_tokens", "output_tokens", "cached_input_tokens")
+WORKER_USAGE = object_schema({
+    **{field: integer(0, 10**12) for field in TOKEN_FIELDS},
+    "tools": array(object_schema({"name": string(100), "calls": integer(0, 10**9)}), 100),
+}, (*TOKEN_FIELDS, "tools"))
+MEMORY_SCOPE = {"task_id": TASK["task_id"], "step_id": string(16)}
 TOOLS = {
     "remember": (
         "Save or update a short, durable main-thread note under a stable key. Save decisions, constraints, facts or handoffs; omit secrets and raw logs.",
-        object_schema({"thread": THREAD, "key": string(90), "kind": choice("decision", "constraint", "fact", "handoff"), "text": string(600)}),
+        object_schema({"thread": THREAD, "key": string(90), "kind": choice("decision", "constraint", "fact", "handoff"), "text": string(600), **MEMORY_SCOPE}, ("task_id", "step_id")),
     ),
     "recall": (
         "Search the main-thread memory by keywords. An empty query returns recent notes.",
-        object_schema({"thread": THREAD, "query": string(240, 0), "limit": integer(1, 5)}, ("limit",)),
+        object_schema({"thread": THREAD, "query": string(240, 0), "limit": integer(1, 5), **MEMORY_SCOPE}, ("limit", "task_id", "step_id")),
     ),
     "plan": (
         "Bundle the routed hypothesis and scout findings with the task brief. Returns minimal worker briefs and a test matrix.",
@@ -75,10 +82,11 @@ TOOLS = {
     ),
     "status": ("Return the current plan, worker reports, and dependency-ready step IDs.", object_schema(TASK)),
     "report": (
-        "Record worker progress and matrix results. Pass the worker name returned by the host as agent_name.",
+        "Record worker progress and matrix results. Pass the worker name as agent_name and optional cumulative worker token and tool counts as usage.",
         object_schema({**TASK, "revision": integer(1, 1000000), "step_id": string(16),
                        "status": choice("running", "done", "blocked"), "evidence": string(550, 0),
-                       "tests": array(TEST_RESULT, 8), "agent_name": string(100)}, ("tests", "agent_name")),
+                       "tests": array(TEST_RESULT, 8), "agent_name": string(100), "usage": WORKER_USAGE},
+                      ("tests", "agent_name", "usage")),
     ),
     "review": (
         "Bundle final test results and the delivered snapshot. Verifies required rows and asks the planner to review complex work.",
@@ -161,14 +169,39 @@ def finish_plan(plan, previous, hypothesis, findings):
     return plan
 
 
+def track_model(store, config, client, tier, instruction, data, schema, *, phase, thread, turn=None, task_id=None):
+    started = time.monotonic()
+    model, usage = "", {}
+
+    def capture(name, measured):
+        nonlocal model
+        model = name
+        for key, count in measured.items():
+            usage[key] = usage.get(key, 0) + count
+
+    try:
+        result = ask(config, client, tier, instruction, data, schema, on_usage=capture)
+    finally:
+        row = store.record_model_usage(client, phase, model, thread, turn, task_id,
+                                       round((time.monotonic() - started) * 1000), usage)
+    return result, row
+
+
 def call_tool(store, config, client, name, args):
     if name not in TOOLS:
         raise ValueError("Unknown tool")
     validate(args, TOOLS[name][1])
     thread = args["thread"]
-    if name == "remember":
-        return store.remember(**args)
-    if name == "recall":
+    if name in {"remember", "recall"}:
+        task_id, step = args.get("task_id"), args.get("step_id")
+        if step and not task_id:
+            raise ValueError("A memory step needs a task ID")
+        if task_id:
+            task = store.get_task(thread, client, task_id)
+            if step and not any(item["id"] == step for item in task["plan"]["steps"]):
+                raise ValueError("Unknown step in this revision")
+        if name == "remember":
+            return store.remember(thread, args["key"], args["kind"], args["text"])
         return {"notes": store.recall(thread, args["query"], args.get("limit", 3))}
     if name == "report":
         task = status(store.report(client=client, **args))
@@ -181,9 +214,12 @@ def call_tool(store, config, client, name, args):
         raise ValueError("Stale revision. Fetch status before continuing.")
     if name == "review":
         previous = store.record_integration(thread, client, args["task_id"], args["revision"], args.get("tests", []))
+        def persist(result):
+            return store.save_review(previous, args["snapshot"], args["integration_evidence"], result)
+
         matrix = previous["plan"].get("test_matrix")
         if not matrix:
-            return {"verdict": "needs_work", "finding": "Revise this task to create its test matrix."}
+            return persist({"verdict": "needs_work", "finding": "Revise this task to create its test matrix."})
         pending = {}
         for row in matrix:
             check_id = row["id"]
@@ -200,17 +236,14 @@ def call_tool(store, config, client, name, args):
             if previous["reports"].get(step["id"], {}).get("status") != "done"
         ]
         if pending or unfinished:
-            return {"verdict": "needs_work", "pending_checks": pending, "unfinished_steps": unfinished}
+            return persist({"verdict": "needs_work", "pending_checks": pending, "unfinished_steps": unfinished})
         if previous["tier"] == "focused":
-            return {"verdict": "complete", "snapshot": args["snapshot"]}
-        verdict = ask(config, client, previous["tier"], REVIEW, {
+            return persist({"verdict": "complete", "snapshot": args["snapshot"]})
+        verdict, _ = track_model(store, config, client, previous["tier"], REVIEW, {
             "work": status(previous), "snapshot": args["snapshot"],
             "integration_evidence": args["integration_evidence"],
-        }, REVIEW_SCHEMA)
-        current = store.get_task(thread, client, args["task_id"])
-        if current["generation"] != previous["generation"]:
-            raise ValueError("Progress changed during review. Fetch status and retry.")
-        return verdict
+        }, REVIEW_SCHEMA, phase="review", thread=thread, task_id=args["task_id"])
+        return persist(verdict)
 
     tier = args.get("tier", previous["tier"] if previous else "focused")
     query = args.get("memory_query", "")
@@ -229,10 +262,14 @@ def call_tool(store, config, client, name, args):
     }
     if previous:
         task_data["previous"] = status(previous)
-    plan = apply_plan_rules(ask(config, client, tier, PLANNER, task_data, PLAN), tier)
-    plan = finish_plan(plan, previous, hypothesis, findings)
     turn = args.get("turn")
-    task = store.revise(previous, tier, plan, turn) if previous else store.create_task(thread, client, tier, plan, turn)
+    response, model_call = track_model(store, config, client, tier, PLANNER, task_data, PLAN,
+                                       phase=name, thread=thread, turn=turn, task_id=args.get("task_id"))
+    plan = finish_plan(apply_plan_rules(response, tier), previous, hypothesis, findings)
+    if previous:
+        task = store.revise(previous, tier, plan, turn, model_call)
+    else:
+        task = store.create_task(thread, client, tier, plan, turn, model_call)
     return status(task)
 
 
@@ -253,6 +290,8 @@ def prompt_hook(store, config, client, event):
     if not isinstance(session, str) or not session:
         return {}
     thread = thread_key(client, session)
+    turn = event.get("turn_id") if client == "codex" else None
+    turn = turn if isinstance(turn, str) and turn else uuid.uuid4().hex
     fingerprint = hashlib.sha256(f"{thread}\0{prompt}".encode()).hexdigest()
     routing = None
     if re.fullmatch(r"(?:hi|hello|thanks|thank you)[.!]?", prompt.strip(), re.IGNORECASE) or re.fullmatch(
@@ -263,14 +302,14 @@ def prompt_hook(store, config, client, event):
         routing = store.cached_route(fingerprint)
     if routing is None:
         try:
-            routing = ask(config, client, "triage", TRIAGE, {"request": clipped(prompt, 2000)}, ROUTE)
+            routing, _ = track_model(store, config, client, "triage", TRIAGE,
+                                     {"request": clipped(prompt, 2000)}, ROUTE,
+                                     phase="triage", thread=thread, turn=turn)
         except (OSError, ValueError, KeyError):
             routing = {"complexity": "unavailable", "hypothesis": ""}
         else:
             store.cache_route(fingerprint, routing)
     route = routing["complexity"]
-    turn = event.get("turn_id") if client == "codex" else None
-    turn = turn if isinstance(turn, str) and turn else uuid.uuid4().hex
     delegated = route in {"focused", "complex"}
     store.set_prompt_gate(thread, turn, delegated, client=client, route=route)
     context = f"Task delegation route {route}. Main-thread memory key {thread}. Turn {turn}. "
@@ -287,7 +326,7 @@ def prompt_hook(store, config, client, event):
             "with the host-returned agent name as agent_name. In report include concise test outcomes "
             "with row IDs, command/results, and a code snapshot. Send final test results and delivered "
             "snapshot in review. Only claim verified if review returns complete. "
-            "Use remember for durable facts and recall for targeted context."
+            "Use remember for durable facts and recall for targeted context. Pass task_id and the step_id when known so the monitor can show memory flow."
         )
     else:
         context += " For unrelated direct work, proceed in the native agent."
@@ -335,11 +374,20 @@ def dispatch(store, config, client, method, params):
     if method == "tools/call":
         if not isinstance(params.get("name"), str):
             raise ValueError("Invalid tool name")
+        name = params["name"]
+        arguments = params.get("arguments", {})
+        task_id = arguments.get("task_id") if isinstance(arguments, dict) else None
+        thread = arguments.get("thread") if isinstance(arguments, dict) else None
+        task_id = task_id if isinstance(task_id, str) else None
+        thread = thread if isinstance(thread, str) else None
         try:
-            result = call_tool(store, config, client, params.get("name"), params.get("arguments", {}))
+            result = call_tool(store, config, client, name, arguments)
         except (OSError, ValueError, KeyError, sqlite3.Error) as error:
+            if name in TOOLS:
+                store.record_tool_call(name, task_id, False, thread, client)
             message = str(error) if isinstance(error, ValueError) and not isinstance(error, json.JSONDecodeError) else "Model or local storage unavailable"
             return {"content": [{"type": "text", "text": message}], "isError": True}
+        store.record_tool_call(name, result.get("task_id", task_id), True, thread, client, arguments.get("step_id"))
         return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
     raise LookupError(method)
 

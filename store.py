@@ -58,6 +58,55 @@ CREATE TABLE IF NOT EXISTS activity (
     step_id TEXT,
     agent_name TEXT
 );
+CREATE TABLE IF NOT EXISTS prompt_activity (
+    event_id INTEGER PRIMARY KEY,
+    thread TEXT NOT NULL,
+    client TEXT NOT NULL,
+    turn TEXT NOT NULL,
+    task_id TEXT
+);
+CREATE INDEX IF NOT EXISTS prompt_activity_turn ON prompt_activity(thread,client,turn);
+CREATE INDEX IF NOT EXISTS prompt_activity_task ON prompt_activity(task_id);
+CREATE TABLE IF NOT EXISTS model_usage (
+    id INTEGER PRIMARY KEY,
+    created REAL NOT NULL,
+    client TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    model TEXT NOT NULL,
+    thread TEXT NOT NULL,
+    turn TEXT,
+    task_id TEXT,
+    duration_ms INTEGER NOT NULL,
+    usage TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS model_usage_task ON model_usage(task_id);
+CREATE INDEX IF NOT EXISTS model_usage_turn ON model_usage(thread, client, turn);
+CREATE TABLE IF NOT EXISTS worker_usage (
+    task_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    step_id TEXT NOT NULL,
+    agent_name TEXT,
+    usage TEXT NOT NULL,
+    PRIMARY KEY (task_id,revision,step_id)
+);
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id INTEGER PRIMARY KEY,
+    task_id TEXT,
+    name TEXT NOT NULL,
+    step_id TEXT,
+    success INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tool_calls_task ON tool_calls(task_id);
+CREATE TABLE IF NOT EXISTS task_reviews (
+    id INTEGER PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    created REAL NOT NULL,
+    snapshot TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    result TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_reviews_task ON task_reviews(task_id);
 CREATE TABLE IF NOT EXISTS prompt_gates (
     thread TEXT PRIMARY KEY,
     turn TEXT NOT NULL,
@@ -120,11 +169,109 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO routes VALUES (?,?,?)", (fingerprint, json.dumps(complexity), now))
 
     def record_activity(self, kind, client, detail, *, task_id=None, revision=None, step_id=None, agent_name=None):
-        self.db.execute(
+        return self.db.execute(
             """INSERT INTO activity (created,kind,client,detail,task_id,revision,step_id,agent_name)
                VALUES (?,?,?,?,?,?,?,?)""",
             (time.time(), kind, client, detail, task_id, revision, step_id, agent_name),
-        )
+        ).lastrowid
+
+    def record_model_usage(self, client, phase, model, thread, turn, task_id, duration_ms, usage):
+        with self.db:
+            return self.db.execute(
+                """INSERT INTO model_usage (created,client,phase,model,thread,turn,task_id,duration_ms,usage)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (time.time(), client, phase, model, thread, turn, task_id, duration_ms, json.dumps(usage)),
+            ).lastrowid
+
+    def link_prompt(self, thread, client, turn, task_id, model_call):
+        if model_call is not None:
+            self.db.execute("UPDATE model_usage SET task_id=? WHERE id=?", (task_id, model_call))
+        if turn:
+            self.db.execute(
+                "UPDATE prompt_activity SET task_id=? WHERE thread=? AND client=? AND turn=? AND task_id IS NULL",
+                (task_id, thread, client, turn),
+            )
+            self.db.execute(
+                """UPDATE model_usage SET task_id=?
+                   WHERE thread=? AND client=? AND turn=? AND phase='triage' AND task_id IS NULL""",
+                (task_id, thread, client, turn),
+            )
+
+    def record_tool_call(self, name, task_id, success, thread, client, step_id=None):
+        with self.db:
+            self.db.execute(
+                """INSERT INTO tool_calls (name,task_id,step_id,success)
+                   VALUES (?, (SELECT id FROM tasks WHERE id=? AND thread=? AND client=?), ?, ?)""",
+                (name, task_id, thread, client, step_id, success),
+            )
+
+    def save_review(self, task, snapshot, evidence, result):
+        with self.db:
+            changed = self.db.execute(
+                """INSERT INTO task_reviews (task_id,revision,created,snapshot,evidence,result)
+                   SELECT id,revision,?,?,?,? FROM tasks WHERE id=? AND generation=?""",
+                (time.time(), snapshot, evidence, json.dumps(result), task["id"], task["generation"]),
+            ).rowcount
+            if not changed:
+                raise ValueError("Progress changed during review. Fetch status and retry.")
+        return result
+
+    def export_task(self, task_id):
+        with self.db:
+            self.db.execute("BEGIN")
+            owner = self.db.execute("SELECT thread,client FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if owner is None:
+                raise ValueError("Unknown task ID")
+            task = self.get_task(owner["thread"], owner["client"], task_id)
+            reviews = [dict(row) for row in self.db.execute(
+                "SELECT revision,created,snapshot,evidence,result FROM task_reviews WHERE task_id=? ORDER BY id",
+                (task_id,),
+            )]
+            for review in reviews:
+                review["result"] = json.loads(review["result"])
+            calls = [dict(row) for row in self.db.execute(
+                """SELECT name,count(*) AS calls,sum(1-success) AS errors
+                   FROM tool_calls WHERE task_id=? GROUP BY name ORDER BY name""", (task_id,),
+            )]
+            usage = [dict(row) for row in self.db.execute(
+                """SELECT created,client,phase,model,duration_ms,usage FROM model_usage
+                   WHERE task_id=? ORDER BY id""", (task_id,),
+            )]
+            workers = [dict(row) for row in self.db.execute(
+                """SELECT revision,step_id,agent_name,usage FROM worker_usage
+                   WHERE task_id=? ORDER BY revision,step_id""", (task_id,),
+            )]
+            for record in (*usage, *workers):
+                record["usage"] = json.loads(record["usage"])
+            return {"task_id": task_id, "client": task["client"], "tier": task["tier"],
+                    "revision": task["revision"], "plan": task["plan"], "reports": task["reports"],
+                    "tests": task["tests"], "reviews": reviews, "model_calls": usage, "tool_calls": calls,
+                    "worker_usage": workers}
+
+    def task_for_prompt(self, event_id):
+        row = self.db.execute("SELECT task_id FROM prompt_activity WHERE event_id=?", (event_id,)).fetchone()
+        return row["task_id"] if row else None
+
+    def graph_activity(self, task_id):
+        with self.db:
+            self.db.execute("BEGIN")
+            task = self.db.execute(
+                """SELECT revision,plan,reports,(
+                     SELECT result FROM task_reviews
+                     WHERE task_id=tasks.id AND revision=tasks.revision ORDER BY id DESC LIMIT 1
+                   ) AS review FROM tasks WHERE id=?""", (task_id,),
+            ).fetchone()
+            if task is None:
+                raise ValueError("Unknown task ID")
+            prompts = [row["detail"] for row in self.db.execute(
+                """SELECT detail FROM prompt_activity JOIN activity ON activity.id=event_id
+                   WHERE prompt_activity.task_id=? ORDER BY event_id""", (task_id,),
+            )]
+            calls = self.db.execute(
+                """SELECT step_id,name,count(*) AS calls,sum(success) AS successes
+                   FROM tool_calls WHERE task_id=? GROUP BY step_id,name ORDER BY step_id,name""", (task_id,),
+            ).fetchall()
+        return task, prompts, calls
 
     def set_prompt_gate(self, thread, turn, required, *, client, route):
         with self.db:
@@ -138,7 +285,8 @@ class Store:
                 )
             else:
                 self.db.execute("DELETE FROM prompt_gates WHERE thread=?", (thread,))
-            self.record_activity("route", client, route)
+            event_id = self.record_activity("route", client, route)
+            self.db.execute("INSERT INTO prompt_activity VALUES (?,?,?,?,NULL)", (event_id, thread, client, turn))
 
     def unlock_prompt(self, thread, turn, task_id):
         if turn:
@@ -166,7 +314,7 @@ class Store:
             result[key] = json.loads(result[key])
         return result
 
-    def create_task(self, thread, client, tier, plan, turn=None):
+    def create_task(self, thread, client, tier, plan, turn=None, model_call=None):
         task_id = uuid.uuid4().hex
         with self.db:
             self.db.execute(
@@ -174,10 +322,11 @@ class Store:
                 (task_id, thread, client, tier, 1, 1, json.dumps(plan), "{}"),
             )
             self.unlock_prompt(thread, turn, task_id)
+            self.link_prompt(thread, client, turn, task_id, model_call)
             self.record_activity("plan", client, tier, task_id=task_id, revision=1)
         return self.get_task(thread, client, task_id)
 
-    def revise(self, previous, tier, plan, turn=None):
+    def revise(self, previous, tier, plan, turn=None, model_call=None):
         with self.db:
             changed = self.db.execute(
                 """UPDATE tasks SET tier=?,revision=revision+1,generation=generation+1,plan=?,reports='{}'
@@ -193,6 +342,7 @@ class Store:
             }
             self.save_tests(previous["id"], retained)
             self.unlock_prompt(previous["thread"], turn, previous["id"])
+            self.link_prompt(previous["thread"], previous["client"], turn, previous["id"], model_call)
             self.record_activity("revise", previous["client"], tier,
                                  task_id=previous["id"], revision=previous["revision"] + 1)
         return self.get_task(previous["thread"], previous["client"], previous["id"])
@@ -228,7 +378,7 @@ class Store:
                 task["generation"] += 1
             return task
 
-    def report(self, thread, client, task_id, revision, step_id, status, evidence, tests=(), agent_name=None):
+    def report(self, thread, client, task_id, revision, step_id, status, evidence, tests=(), agent_name=None, usage=None):
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             task = self.get_task(thread, client, task_id)
@@ -243,6 +393,9 @@ class Store:
             agent_name = agent_name or previous.get("agent_name")
             if agent_name:
                 update["agent_name"] = agent_name
+            usage = usage if usage is not None else previous.get("usage")
+            if usage is not None:
+                update["usage"] = usage
             merged = self.merge_tests(task, tests)
             if previous == update and task["tests"] == merged:
                 return task
@@ -258,6 +411,11 @@ class Store:
                 (json.dumps(reports), task_id),
             )
             self.save_tests(task_id, merged)
+            if usage is not None:
+                self.db.execute(
+                    """INSERT OR REPLACE INTO worker_usage VALUES (?,?,?,?,?)""",
+                    (task_id, revision, step_id, agent_name, json.dumps(usage)),
+                )
             if (status, agent_name) != (previous.get("status"), previous.get("agent_name")):
                 self.record_activity("step", client, status, task_id=task_id, revision=revision,
                                      step_id=step_id, agent_name=agent_name)

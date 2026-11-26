@@ -20,7 +20,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 
-from delegate import call_tool
+from delegate import call_tool, dispatch
 from installer import FILES, curses
 from store import Store
 
@@ -264,6 +264,72 @@ class InstallTest(unittest.TestCase):
         with self.terminal("monitor", "--once") as (master, process):
             self.expect_terminal(master, b"agent=Dev Agent")
             self.assertEqual(process.wait(timeout=5), 0)
+
+    @unittest.skipUnless(curses, "needs curses")
+    def test_efficiency_dashboard_export_and_task_graph(self):
+        self.install("--no-setup")
+        store = Store(self.state / "state.sqlite3")
+        self.addCleanup(store.db.close)
+        store.set_prompt_gate("test", "turn", True, client="codex", route="focused")
+        with self.terminal("monitor") as (master, process):
+            self.expect_terminal(master, b"Timeline")
+            os.write(master, b"g")
+            self.expect_terminal(master, b"Waiting for a plan")
+            task = store.create_task("test", "codex", "focused", {
+                "steps": [{"id": "implement", "mode": "write", "needs": []},
+                          {"id": "verify", "mode": "read", "needs": ["implement"]}],
+            }, turn="turn")
+            task_id = task["id"]
+            self.expect_terminal(master, b"Prompt (focused)")
+            def tool(name, **arguments):
+                response = dispatch(store, {}, "codex", "tools/call", {
+                    "name": name, "arguments": {"thread": "test", "task_id": task_id, **arguments},
+                })
+                self.assertFalse(response.get("isError"), response)
+
+            tool("report", revision=1, step_id="implement", status="running",
+                 evidence="Started", agent_name="Dev Agent",
+                 usage={"input_tokens": 5, "tools": [{"name": "Read", "calls": 1}]})
+            self.expect_terminal(master, b"Dev Agent (running)")
+            tool("remember", step_id="implement", key="test-note", kind="fact", text="Private note body")
+            tool("recall", step_id="verify", query="test")
+            self.expect_terminal(master, b"recall")
+            os.write(master, b"q")
+            self.expect_terminal(master, b"?1049l")
+            self.assertEqual(process.wait(timeout=5), 0)
+
+        tool("report", revision=1, step_id="implement", status="done",
+             evidence="Finished", usage={"input_tokens": 20, "tools": [{"name": "Read", "calls": 3}]})
+        store.record_model_usage("codex", "plan", "test-model", "test", "turn", task_id, 12,
+                                 {"input_tokens": 30, "output_tokens": 8})
+        tool("review", revision=1, snapshot="test-snapshot", integration_evidence="Test evidence")
+        output = self.run_command(self.launcher, "stats").stdout
+        for label, count in (("focused", 1), ("plan input", 30), ("worker input", 20),
+                             ("MCP: recall", 1), ("Worker: Read", 3)):
+            self.assertRegex(output, rf"{label} +{count} +#")
+        with self.terminal("stats") as (master, process):
+            self.expect_terminal(master, b"DELEG8R / STATS")
+            os.write(master, b"7")
+            self.expect_terminal(master, b"Measured tokens by phase")
+            os.write(master, b"8")
+            self.expect_terminal(master, b"Tool calls by name and source")
+            os.write(master, b"q")
+            self.expect_terminal(master, b"?1049l")
+            self.assertEqual(process.wait(timeout=5), 0)
+
+        snapshot = self.run_command(self.launcher, "monitor", "--task", task_id, "--once").stdout
+        self.assertIn("[implement · Dev Agent (done)] ── dependency ──▶ [verify (pending)]", snapshot)
+        self.assertIn("write ──▶ [Memory]", snapshot)
+        self.assertIn("[Memory] ── recall ×1", snapshot)
+        self.assertNotIn("Private note body", snapshot)
+        exported = json.loads(self.run_command(self.launcher, "export", task_id).stdout)
+        self.assertEqual(exported["plan"], task["plan"])
+        self.assertEqual(exported["reviews"][0]["result"]["verdict"], "needs_work")
+        self.assertEqual(exported["reviews"][0]["snapshot"], "test-snapshot")
+        self.assertEqual(exported["model_calls"][0]["usage"]["input_tokens"], 30)
+        self.assertEqual(exported["worker_usage"][0]["usage"]["input_tokens"], 20)
+        self.assertEqual({row["name"]: row["calls"] for row in exported["tool_calls"]},
+                         {"report": 2, "remember": 1, "recall": 1, "review": 1})
 
     def test_activity_cli_opens_legacy_database(self):
         self.install("--no-setup")

@@ -29,11 +29,19 @@ deleg8r monitor
 deleg8r monitor --tail 50 --once
 ```
 
-`stats` opens a dashboard with bar charts for prompt routes, task tiers and status, clients, worker modes, and reported agent names. Use Left/Right, Tab, or 1–6 to switch charts, Up/Down to scroll, and R to reload. Existing tasks are included. Prompt route counts start when the updated hooks run.
+`stats` opens a dashboard with bar charts for prompt routes, task tiers and status, clients, worker modes, and reported agent names. Use Left/Right, Tab, or 1–8 to switch charts, Up/Down to scroll, and R to reload. Existing tasks are included. Prompt route counts start when the updated hooks run. Tabs 7 and 8 break down measured input, output, and cached input tokens by phase and tool calls by name and source. Cached input is part of the input total. Deleg8r records its own model usage when the provider reports it and counts calls to its MCP tools. Native worker counts appear when a worker or host includes cumulative `usage` in a step report. Missing data and activity from before collection began are not estimated.
 
-`monitor` shows a live timeline of routes, plans, revisions, and worker handoffs. Use Up/Down to inspect events, End to return to the latest event, Space to pause or resume, and F to cycle event filters. Both views quit with Q.
+`monitor` shows a live timeline of routes, plans, revisions, and worker handoffs. Use Up/Down to inspect events, End to return to the latest event, Space to pause or resume, and F to cycle event filters. Press G on a prompt, plan, or step event to follow its task graph. On a prompt, the graph waits for the linked plan. The graph uses plan dependencies to connect work nodes, shows agent names and current status, and draws observed MCP and memory read/write paths when calls carry a task ID. Pass both `task_id` and `step_id` to `remember` or `recall` to link the call to a worker node. The graph shows call metadata without memory contents. Press G again to return to the timeline. Both views quit with Q.
 
-Both commands use plain text when piped or with `--plain`. For the monitor, `--tail 0` shows only new events and `--once` prints history and exits. Both commands accept `--db /absolute/path/state.sqlite3` for project-only setups. Restart active clients after updating so their MCP process can record new events.
+```sh
+deleg8r monitor --task TASK_ID
+deleg8r monitor --task TASK_ID --once
+deleg8r export TASK_ID > task.json
+```
+
+Copy the full task ID from the monitor details or MCP `status` result. The JSON export includes the current plan, reports, tests, review history with revisions and verdicts, model usage and duration, MCP call counts and errors, and reported worker usage. Exports include task evidence. Review history starts with reviews recorded after upgrading.
+
+Both commands use plain text when piped or with `--plain`. For the monitor, `--tail 0` shows only new events and `--once` prints history and exits. `stats`, `monitor`, and `export` accept `--db /absolute/path/state.sqlite3` for project-only setups. Restart active clients after updating so their MCP process can record new events.
 
 Worker handoffs appear when the native host calls `report`. The host can send the real worker name as `agent_name` when reporting `running`, and later reports for the step inherit it. The monitor shows `agent=unreported` when no name was supplied. It displays activity metadata without including prompts, worker briefs, or report evidence.
 

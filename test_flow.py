@@ -11,6 +11,8 @@ import tempfile
 import tomllib
 import unittest
 
+from store import Store
+
 
 ENTRY = Path(__file__).with_name("delegate.py")
 FAKE_MODEL = """#!/usr/bin/env python3
@@ -36,9 +38,13 @@ else:
              'scenario': 'Load the correct board state', 'expected': 'Shows the saved note',
              'required': 'yes', 'finding': 'f1'}], 'retired_checks': []}
 if Path(sys.argv[0]).name == 'claude':
-    print(json.dumps({'structured_output': result}))
+    print(json.dumps({'structured_output': result, 'usage': {'input_tokens': 40,
+          'output_tokens': 10, 'cache_read_input_tokens': 5, 'cache_creation_input_tokens': 5}}))
 else:
+    assert '--json' in sys.argv
     Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text(json.dumps(result))
+    print(json.dumps({'type': 'turn.completed', 'usage': {
+          'input_tokens': 50, 'cached_input_tokens': 5, 'output_tokens': 10}}))
 """
 
 
@@ -94,11 +100,23 @@ class DelegationFlow(unittest.TestCase):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         ) as process:
             try:
-                self.verify_workflow(process, run_hook, edit, thread, turn, log)
+                task_id = self.verify_workflow(process, run_hook, edit, thread, turn, log)
             finally:
                 process.stdin.close()
         self.assertEqual(process.returncode, 0)
         self.assertEqual(run_hook({**edit, "turn_id": turn}), {})
+
+        store = Store(root / "state.sqlite3")
+        self.addCleanup(store.db.close)
+        exported = store.export_task(task_id)
+        self.assertEqual([call["phase"] for call in exported["model_calls"]],
+                         ["triage", "plan", "review", "revise"])
+        for call in exported["model_calls"]:
+            self.assertEqual(call["usage"]["input_tokens"], 50)
+            self.assertEqual(call["usage"]["output_tokens"], 10)
+            self.assertEqual(call["usage"]["cached_input_tokens"], 5)
+        self.assertEqual([review["result"]["verdict"] for review in exported["reviews"]],
+                         ["needs_work", "complete", "complete"])
 
     def verify_workflow(self, process, run_hook, edit, thread, turn, log):
         sequence = 0
@@ -154,6 +172,7 @@ class DelegationFlow(unittest.TestCase):
         self.assertEqual(tool("review", **task, **review, tests=[both_checks])["verdict"], "complete")
         calls = [json.loads(line)["kind"].split()[0] for line in log.read_text().splitlines()]
         self.assertEqual(calls, ["Classify", "Plan", "Review", "Plan"])
+        return task["task_id"]
 
     def test_claude(self):
         self.run_client("claude")

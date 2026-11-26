@@ -467,10 +467,27 @@ def activity_counts(path):
             else:
                 task_states["in progress"] += 1
 
+        tokens, tools = Counter(), Counter()
+        token_labels = (("input_tokens", "input"), ("output_tokens", "output"),
+                        ("cached_input_tokens", "cached"))
+        for row in db.execute("""SELECT phase,usage FROM model_usage
+                                 UNION ALL SELECT 'worker',usage FROM worker_usage"""):
+            usage = json.loads(row["usage"])
+            for field, label in token_labels:
+                if field in usage:
+                    tokens[f"{row['phase']} {label}"] += usage[field]
+        for row in db.execute("SELECT name,count(*) AS calls FROM tool_calls GROUP BY name"):
+            tools[f"MCP: {row['name']}"] = row["calls"]
+        for row in db.execute("SELECT usage FROM worker_usage"):
+            usage = json.loads(row["usage"])
+            for tool in usage.get("tools", []):
+                tools[f"Worker: {tool['name']}"] += tool["calls"]
+
     return sum(tiers.values()), (
         ("Recorded prompt routes", routes), ("Task tiers", tiers),
         ("Task status", task_states), ("Tasks by client", clients),
         ("Current steps by mode", modes), ("Current steps by reported agent", agents),
+        ("Measured tokens by phase", tokens), ("Tool calls by name and source", tools),
     )
 
 
@@ -513,7 +530,7 @@ def screen_line(screen, row, text, style=0, column=0):
 def stats_dashboard(screen, path):
     accents = dashboard_colors()
     total, charts = activity_counts(path)
-    tabs = "Routes  Tiers  Status  Clients  Modes  Agents".split()
+    tabs = "Routes  Tiers  Status  Clients  Modes  Agents  Tokens  Tools".split()
     selected = offset = 0
     while True:
         height, width = screen.getmaxyx()
@@ -522,7 +539,10 @@ def stats_dashboard(screen, path):
         position = 1
         for index, tab in enumerate(tabs):
             label = f" {index + 1}:{tab} "
-            screen_line(screen, 2, label, curses.A_REVERSE if index == selected else accents[0], position)
+            if index == 4:
+                position = 1
+            screen_line(screen, 2 + index // 4, label,
+                        curses.A_REVERSE if index == selected else accents[0], position)
             position += len(label) + 1
         title, counts = charts[selected]
         screen_line(screen, 4, title, curses.A_BOLD, 1)
@@ -538,12 +558,12 @@ def stats_dashboard(screen, path):
             if peak and count and bar_width:
                 length = max(1, round(bar_width * count / peak))
                 screen_line(screen, row, "█" * length, accents[selected % len(accents)], 32)
-        screen_line(screen, height - 1, " ←/→ Tabs   1–6 Jump   ↑/↓ Scroll   r Reload   q Quit ", curses.A_REVERSE)
+        screen_line(screen, height - 1, " ←/→ Tabs   1–8 Jump   ↑/↓ Scroll   r Reload   q Quit ", curses.A_REVERSE)
         key = screen.getch()
         if key in (ord("q"), 27):
             return
-        if key in (curses.KEY_RIGHT, 9, curses.KEY_LEFT) or ord("1") <= key <= ord("6"):
-            if ord("1") <= key <= ord("6"):
+        if key in (curses.KEY_RIGHT, 9, curses.KEY_LEFT) or ord("1") <= key <= ord("8"):
+            if ord("1") <= key <= ord("8"):
                 selected = key - ord("1")
             else:
                 selected = (selected + (-1 if key == curses.KEY_LEFT else 1)) % len(charts)
@@ -587,7 +607,92 @@ def recent_events(db, tail, cursor):
 EVENT_STYLES = {"route": ("●", 0), "plan": ("◆", 1), "revise": ("◇", 3), "step": ("■", 2)}
 
 
-def monitor_dashboard(screen, db, tail):
+def task_graph(store, task_id):
+    task, prompts, calls = store.graph_activity(task_id)
+    reports = json.loads(task["reports"])
+    steps = json.loads(task["plan"])["steps"]
+    plan = f"Plan r{task['revision']}"
+    nodes = {}
+    for step in steps:
+        step_id = step["id"]
+        report = reports.get(step_id, {})
+        agent = report.get("agent_name")
+        state = report.get("status", "pending")
+        nodes[step_id] = f"{step_id} · {agent} ({state})" if agent else f"{step_id} ({state})"
+
+    def edge(source, link, target):
+        return f"[{source}] ── {link} ──▶ [{target}]"
+
+    lines = [edge(f"Prompt ({route})", "route", plan) for route in prompts]
+    if not lines:
+        lines = [f"[{plan}]  Prompt unavailable"]
+    terminal_steps = set(nodes)
+    for step in steps:
+        target = nodes[step["id"]]
+        if not step["needs"]:
+            lines.append(edge(plan, "dispatch", target))
+        for predecessor in step["needs"]:
+            terminal_steps.discard(predecessor)
+            lines.append(edge(nodes[predecessor], "dependency", target))
+
+    verdict = json.loads(task["review"])["verdict"] if task["review"] else "pending"
+    leaves = [nodes[step["id"]] for step in steps if step["id"] in terminal_steps] or [plan]
+    lines.extend(edge(source, "review", f"Review ({verdict})") for source in leaves)
+
+    lines.extend(("", "MCP and memory flow"))
+    if not calls:
+        lines.append("No task-scoped calls yet")
+    for call in calls:
+        actor = nodes.get(call["step_id"], call["step_id"]) or "Host"
+        label = f"{call['name']} ×{call['calls']}"
+        if call["calls"] != call["successes"]:
+            label += f" ({call['calls'] - call['successes']} errors)"
+        if call["name"] == "recall" and call["successes"]:
+            lines.append(f"[Memory] ── {label} ──▶ [MCP] ── result ──▶ [{actor}]")
+        elif call["name"] == "remember" and call["successes"]:
+            lines.append(f"[{actor}] ── {label} ──▶ [MCP] ── write ──▶ [Memory]")
+        else:
+            lines.append(edge(actor, label, "MCP"))
+    return lines
+
+
+def graph_dashboard(screen, store, task_id, prompt_id=None):
+    accents = dashboard_colors()
+    offset = 0
+    horizontal = 0
+    screen.timeout(500)
+    while True:
+        if task_id is None:
+            task_id = store.task_for_prompt(prompt_id)
+        lines = task_graph(store, task_id) if task_id else ["Waiting for a plan linked to this prompt…"]
+        height, _ = screen.getmaxyx()
+        visible = max(1, height - 4)
+        offset = min(offset, max(0, len(lines) - visible))
+        screen.erase()
+        screen_line(screen, 0, " DELEG8R / TASK GRAPH", accents[0])
+        screen_line(screen, 1, task_id or f"Prompt event {prompt_id}", column=1)
+        for y, line in enumerate(lines[offset:offset + visible], 2):
+            screen_line(screen, y, terminal_text(line)[horizontal:], accents[2] if "▶" in line else curses.A_BOLD, 1)
+        screen_line(screen, height - 1, " ↑/↓ Scroll   ←/→ Pan   g Timeline   q Quit ", curses.A_REVERSE)
+        key = screen.getch()
+        if key in (ord("q"), 27):
+            return False
+        if key == ord("g"):
+            return True
+        if key == curses.KEY_DOWN:
+            offset += 1
+        elif key == curses.KEY_UP:
+            offset = max(0, offset - 1)
+        elif key == curses.KEY_RIGHT:
+            horizontal = min(max(map(len, lines), default=0), horizontal + 8)
+        elif key == curses.KEY_LEFT:
+            horizontal = max(0, horizontal - 8)
+
+
+def monitor_dashboard(screen, store, tail, task_id=None):
+    if task_id and not graph_dashboard(screen, store, task_id):
+        return
+    db = store.db
     accents = dashboard_colors()
     recent, cursor = recent_events(db, tail, 0)
     events = deque(recent, maxlen=1000)
@@ -633,7 +738,7 @@ def monitor_dashboard(screen, db, tail):
                 screen_line(screen, height - 3, f"Task {event['task_id']}  revision {event['revision']}", column=1)
         else:
             screen_line(screen, 5, "Waiting for matching activity…", column=1)
-        screen_line(screen, height - 1, " ↑/↓ Inspect   End Latest   Space Pause   f Filter   q Quit ", curses.A_REVERSE)
+        screen_line(screen, height - 1, " ↑/↓ Inspect   End Latest   Space Pause   f Filter   g Graph   q Quit ", curses.A_REVERSE)
         key = screen.getch()
         if key in (ord("q"), 27):
             return
@@ -642,6 +747,11 @@ def monitor_dashboard(screen, db, tail):
         elif key == ord("f"):
             selected_filter = (selected_filter + 1) % len(filters)
             selected_id = None
+        elif key == ord("g") and filtered:
+            event = filtered[selected]
+            if event["task_id"] or event["kind"] == "route":
+                if not graph_dashboard(screen, store, event["task_id"], event["id"]):
+                    return
         elif key == curses.KEY_END:
             selected_id = None
         elif filtered and key in (curses.KEY_UP, curses.KEY_DOWN):
@@ -649,11 +759,15 @@ def monitor_dashboard(screen, db, tail):
             selected_id = filtered[index]["id"]
 
 
-def monitor(path, tail, once, plain=False):
+def monitor(path, tail, once, plain=False, task_id=None):
     if not 0 <= tail <= 1000:
         raise ValueError("--tail must be between 0 and 1000")
-    with contextlib.closing(Store(path).db) as db:
-        if not once and not plain and terminal_dashboard(monitor_dashboard, db, tail):
+    store = Store(path)
+    with contextlib.closing(store.db) as db:
+        if not once and not plain and terminal_dashboard(monitor_dashboard, store, tail, task_id):
+            return
+        if task_id:
+            print("\n".join(map(terminal_text, task_graph(store, task_id))))
             return
         recent, cursor = recent_events(db, tail, 0)
         for event in recent:
@@ -695,7 +809,11 @@ def main():
         view.add_argument("--db", type=Path, help="Use a project-specific delegation database")
         view.add_argument("--plain", action="store_true", help="Use plain-text output in a terminal")
     watch.add_argument("--tail", type=int, default=20, help="Recent events to show before following (default: 20)")
+    watch.add_argument("--task", help="Open the dependency graph for this task ID")
     watch.add_argument("--once", action="store_true", help="Print recent events and exit")
+    export = commands.add_parser("export", help="Export one task and its reviews as JSON")
+    export.add_argument("task_id", help="Task ID from the monitor or MCP status")
+    export.add_argument("--db", type=Path, help="Use a project-specific delegation database")
     configuration = commands.add_parser("setup", help="Alias for hook")
     configuration.add_argument("--client", choices=("auto", "claude", "codex"), default="auto")
     hook = commands.add_parser("hook", help="Connect Claude Code, Codex, or both")
@@ -741,7 +859,12 @@ def main():
         if args.action == "stats":
             stats(database, args.plain)
         else:
-            monitor(database, args.tail, args.once, args.plain)
+            monitor(database, args.tail, args.once, args.plain, args.task)
+    elif args.action == "export":
+        database = args.db.expanduser() if args.db else root / "state.sqlite3"
+        store = Store(database)
+        with contextlib.closing(store.db):
+            print(json.dumps(store.export_task(args.task_id), indent=2, ensure_ascii=False))
     elif args.action == "setup":
         setup(root, bin_dir, args.client)
     elif args.action == "hook" and not args.client:

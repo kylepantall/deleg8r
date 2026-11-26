@@ -110,7 +110,24 @@ def model_settings(config, client, tier):
     return raw
 
 
-def ask(config, client, tier, instruction, data, schema):
+def measured_tokens(client, usage):
+    if not isinstance(usage, dict):
+        return {}
+    keys = ("input_tokens", "output_tokens")
+    values = {key: usage[key] for key in keys if type(usage.get(key)) is int and usage[key] >= 0}
+    cache_key = "cache_read_input_tokens" if client == "claude" else "cached_input_tokens"
+    cached = usage.get(cache_key)
+    if type(cached) is int and cached >= 0:
+        values["cached_input_tokens"] = cached
+    if client == "claude" and "input_tokens" in values:
+        created = usage.get("cache_creation_input_tokens", 0)
+        if type(created) is int and created >= 0:
+            values["cache_creation_input_tokens"] = created
+        values["input_tokens"] += values.get("cached_input_tokens", 0) + values.get("cache_creation_input_tokens", 0)
+    return values
+
+
+def ask(config, client, tier, instruction, data, schema, on_usage=None):
     settings = model_settings(config, client, tier)
     model, effort = settings["model"], settings["effort"]
     env = dict(os.environ, TASK_DELEGATION_CHILD="1")
@@ -135,7 +152,7 @@ def ask(config, client, tier, instruction, data, schema):
         else:
             argv = [
                 "codex", "-a", "never", "exec", "--ignore-user-config", "--ephemeral",
-                "--skip-git-repo-check", "--sandbox", "read-only",
+                "--json", "--skip-git-repo-check", "--sandbox", "read-only",
                 "--disable", "hooks", "--disable", "shell_tool", "--disable", "unified_exec",
                 "--disable", "multi_agent", "--disable", "multi_agent_v2",
                 "--disable", "image_generation", "-c", 'web_search="disabled"',
@@ -159,12 +176,22 @@ def ask(config, client, tier, instruction, data, schema):
                 raise ValueError(f"{client} {tier} model failed (exit {child.returncode})")
         if client == "claude":
             envelope = json.loads(stdout)
+            if on_usage:
+                on_usage(model, measured_tokens(client, envelope.get("usage")))
             if envelope.get("is_error"):
                 raise ValueError(f"{client} {tier} model returned an error")
             data = envelope.get("structured_output")
             if data is None:
                 data = json.loads(envelope.get("result", ""))
         else:
+            if on_usage:
+                for line in stdout.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict) and event.get("type") == "turn.completed":
+                        on_usage(model, measured_tokens(client, event.get("usage")))
             data = json.loads(result_path.read_text(encoding="utf-8"))
     validate(data, schema, "model response")
     return data
