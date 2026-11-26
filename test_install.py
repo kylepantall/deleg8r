@@ -1,8 +1,10 @@
 """Installer lifecycle checks with disposable source archives and client settings."""
 
+import asyncio
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -21,7 +23,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from delegate import call_tool, dispatch
-from installer import FILES, curses
+from installer import FILES, curses, textual_graph
 from store import Store
 
 
@@ -244,7 +246,7 @@ class InstallTest(unittest.TestCase):
             os.write(master, b"q")
             self.expect_terminal(master, b"?1049l")
             self.assertEqual(process.wait(timeout=5), 0)
-        with self.terminal("monitor") as (master, process):
+        with self.terminal("monitor", "--classic") as (master, process):
             self.expect_terminal(master, b"Timeline")
             self.report_activity(store, task, "running", agent_name="Dev Agent")
             self.expect_terminal(master, b"Dev Agent")
@@ -271,7 +273,7 @@ class InstallTest(unittest.TestCase):
         store = Store(self.state / "state.sqlite3")
         self.addCleanup(store.db.close)
         store.set_prompt_gate("test", "turn", True, client="codex", route="focused")
-        with self.terminal("monitor") as (master, process):
+        with self.terminal("monitor", "--classic") as (master, process):
             self.expect_terminal(master, b"Timeline")
             os.write(master, b"g")
             self.expect_terminal(master, b"Waiting for a plan")
@@ -330,6 +332,43 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(exported["worker_usage"][0]["usage"]["input_tokens"], 20)
         self.assertEqual({row["name"]: row["calls"] for row in exported["tool_calls"]},
                          {"report": 2, "remember": 1, "recall": 1, "review": 1})
+
+    @unittest.skipUnless(importlib.util.find_spec("textual"), "needs optional Textual dependency")
+    def test_textual_graph_moves_real_task_nodes(self):
+        store = Store(self.state / "state.sqlite3")
+        self.addCleanup(store.db.close)
+        task = store.create_task("test", "codex", "focused", {
+            "steps": [{"id": "inspect", "needs": [], "mode": "read"},
+                      {"id": "verify", "needs": ["inspect"], "mode": "read"}],
+        })
+
+        async def check_graph():
+            app = textual_graph(store, task["id"])
+            async with app.run_test(size=(72, 20)) as pilot:
+                canvas = app.canvas
+                self.assertEqual(list(canvas.nodes), ["@prompt", "@plan", "inspect", "verify", "@review"])
+                initial_edges = str(canvas.edges.render())
+                self.assertIn("►", initial_edges)
+                plan = canvas.nodes["@plan"]
+                before = (plan.x, plan.y)
+                await pilot.press("tab", "down")
+                self.assertTrue(plan.has_class("selected"))
+                self.assertEqual((plan.x, plan.y), (before[0], before[1] + 1))
+                self.assertNotEqual(str(canvas.edges.render()), initial_edges)
+                await pilot.press("3")
+                self.assertTrue(canvas.nodes["inspect"].has_class("selected"))
+                self.assertGreater(canvas.parent.scroll_offset.x, 0)
+                store.report("test", "codex", task["id"], 1, "inspect", "running", "",
+                             agent_name="Scout Agent")
+                store.record_tool_call("remember", task["id"], True, "test", "codex", "inspect")
+                await app.refresh_task()
+                self.assertEqual((plan.x, plan.y), (before[0], before[1] + 1))
+                self.assertIn("Scout Agent", str(canvas.nodes["inspect"].render()))
+                self.assertIn("@memory", canvas.nodes)
+                self.assertIn(("@mcp", "@memory"), canvas.snapshot[1])
+                await pilot.press("q")
+
+        asyncio.run(check_graph())
 
     def test_activity_cli_opens_legacy_database(self):
         self.install("--no-setup")

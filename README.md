@@ -39,6 +39,14 @@ deleg8r monitor --task TASK_ID --once
 deleg8r export TASK_ID > task.json
 ```
 
+To use the interactive node canvas, install the optional Textual dependency in the same Python environment that runs your Deleg8r launcher:
+
+```sh
+pip install textual
+```
+
+The monitor uses the canvas when Textual is available. Tab or keys 1–9 select nodes, the arrow keys move the selected node and reroute its connections, G returns to the timeline, and Q quits. The canvas scrolls as you move or select nodes. Each node shows its position and live status. Use `monitor --classic` for the original terminal graph, which is also the default without Textual.
+
 Copy the full task ID from the monitor details or MCP `status` result. The JSON export includes the current plan, reports, tests, review history with revisions and verdicts, model usage and duration, MCP call counts and errors, and reported worker usage. Exports include task evidence. Review history starts with reviews recorded after upgrading.
 
 Both commands use plain text when piped or with `--plain`. For the monitor, `--tail 0` shows only new events and `--once` prints history and exits. `stats`, `monitor`, and `export` accept `--db /absolute/path/state.sqlite3` for project-only setups. Restart active clients after updating so their MCP process can record new events.

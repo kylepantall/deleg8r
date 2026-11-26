@@ -1,8 +1,11 @@
 """Install, configure and update deleg8r from its public source repository."""
 
+from __future__ import annotations
+
 import argparse
 import contextlib
 import fcntl
+import heapq
 import json
 import os
 import re
@@ -656,6 +659,264 @@ def task_graph(store, task_id):
     return lines
 
 
+# pip install textual
+def textual_graph(store, task_id, prompt_id=None):
+    """Open the optional Textual view. Import it only for interactive graphs."""
+    from rich.text import Text
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import ScrollableContainer
+    from textual.geometry import Offset, Region
+    from textual.widgets import Footer, Static
+
+    node_width, node_height = 22, 5
+    directions = ((1, 0), (0, 1), (0, -1), (-1, 0))
+    # Direction flags are ordered east, south, north, west.
+    glyphs = {
+        (1, 0, 0, 1): "─", (0, 1, 1, 0): "│",
+        (1, 1, 0, 0): "┌", (0, 1, 0, 1): "┐",
+        (1, 0, 1, 0): "└", (0, 0, 1, 1): "┘",
+        (1, 1, 1, 0): "├", (0, 1, 1, 1): "┤",
+        (1, 1, 0, 1): "┬", (1, 0, 1, 1): "┴", (1, 1, 1, 1): "┼",
+    }
+
+    class NodeWidget(Static):
+        def __init__(self, x: int, y: int) -> None:
+            super().__init__(classes="graph-node", markup=False)
+            self.x, self.y = x, y
+            self.styles.offset = Offset(x, y)
+
+        def set_content(self, title: str, value: str) -> None:
+            text = Text(overflow="ellipsis", no_wrap=True)
+            text.append(terminal_text(title) + "\n", style="bold")
+            text.append(terminal_text(value) + "\n")
+            text.append(f"({self.x}, {self.y})", style="dim")
+            self.update(text)
+
+    class GraphCanvas(Static):
+        def __init__(self) -> None:
+            super().__init__(id="graph-canvas")
+            self.nodes: dict[str, NodeWidget] = {}
+            self.active = 0
+            self.snapshot: tuple = ()
+            self.edges = Static(id="graph-edges", markup=False)
+
+        def compose(self) -> ComposeResult:
+            yield self.edges
+
+        async def sync(self, descriptions: dict, links: tuple) -> None:
+            snapshot = (descriptions, links)
+            if self.snapshot == snapshot:
+                return
+            self.snapshot = snapshot
+            for key in list(self.nodes):
+                if key not in descriptions:
+                    await self.nodes.pop(key).remove()
+            for index, key in enumerate(descriptions):
+                if key in self.nodes:
+                    continue
+                column, row = index % 3, index // 3
+                x, y = 4 + 31 * column, 2 + 8 * row
+                # Keep nodes already moved by the user in their current positions.
+                while any(abs(node.x - x) < node_width + 3 and abs(node.y - y) < node_height
+                          for node in self.nodes.values()):
+                    y += 8
+                node = self.nodes[key] = NodeWidget(x, y)
+                await self.mount(node)
+            self.active = min(self.active, max(0, len(self.nodes) - 1))
+            self.draw()
+
+        def select(self, index: int) -> None:
+            if self.nodes and -1 <= index < len(self.nodes):
+                self.active = index % len(self.nodes)
+                self.draw()
+                node = list(self.nodes.values())[self.active]
+                self.reveal(node)
+
+        def move(self, dx: int, dy: int) -> None:
+            if not self.nodes:
+                return
+            selected = list(self.nodes.values())[self.active]
+            x, y = max(3, selected.x + dx), max(1, selected.y + dy)
+            if any(node is not selected and abs(node.x - x) < node_width + 3
+                   and abs(node.y - y) < node_height for node in self.nodes.values()):
+                return
+            selected.x, selected.y = x, y
+            selected.styles.offset = Offset(x, y)
+            self.draw()
+            self.reveal(selected)
+
+        def reveal(self, node: NodeWidget) -> None:
+            self.call_after_refresh(self.parent.scroll_to_region,
+                                    Region(node.x, node.y, node_width, node_height), animate=False)
+
+        def route(self, start: tuple[int, int], end: tuple[int, int], blocked: set[tuple[int, int]],
+                  wires: dict, bounds: Region) -> list[tuple[int, int]]:
+            # Prefer short routes, but avoid existing wires when a small detour works.
+            queue = [(0, start)]
+            previous = {start: None}
+            cost = {start: 0}
+            while queue:
+                distance, point = heapq.heappop(queue)
+                if distance != cost[point]:
+                    continue
+                if point == end:
+                    path = [point]
+                    while previous[path[-1]] is not None:
+                        path.append(previous[path[-1]])
+                    return path[::-1]
+                x, y = point
+                for dx, dy in directions:
+                    next_point = (x + dx, y + dy)
+                    if next_point in blocked or not bounds.contains(*next_point):
+                        continue
+                    next_cost = distance + (5 if next_point in wires else 1)
+                    if next_point not in cost or next_cost < cost[next_point]:
+                        previous[next_point] = point
+                        cost[next_point] = next_cost
+                        heapq.heappush(queue, (next_cost, next_point))
+            return []
+
+        def draw(self) -> None:
+            descriptions, links = self.snapshot
+            width = max(96, max((node.x + node_width + 4 for node in self.nodes.values()), default=0))
+            height = max(22, max((node.y + node_height + 3 for node in self.nodes.values()), default=0))
+            self.styles.width = self.edges.styles.width = width
+            self.styles.height = self.edges.styles.height = height
+            occupied = set()
+            for index, (key, node) in enumerate(self.nodes.items()):
+                node.set_class(index == self.active, "selected")
+                node.set_content(*descriptions[key])
+                occupied.update((x, y) for x in range(node.x, node.x + node_width)
+                                for y in range(node.y, node.y + node_height))
+                occupied.update(((node.x - 1, node.y + 2), (node.x + node_width, node.y + 2)))
+            marks: dict[tuple, set] = {}
+            arrows = set()
+            for source, destination in links:
+                parent, child = self.nodes[source], self.nodes[destination]
+                output = (parent.x + node_width - 1, parent.y + 2)
+                arrow = (child.x - 1, child.y + 2)
+                start, end = (output[0] + 2, output[1]), (arrow[0] - 1, arrow[1])
+                path = self.route(start, end, occupied - {end}, marks, Region(0, 0, width, height))
+                if not path:
+                    continue
+                path = [output, (output[0] + 1, output[1]), *path, arrow]
+                arrows.add(arrow)
+                for (x, y), (nx, ny) in zip(path, path[1:]):
+                    marks.setdefault((x, y), set()).add((nx - x, ny - y))
+                    marks.setdefault((nx, ny), set()).add((x - nx, y - ny))
+            rows = [[" "] * width for _ in range(height)]
+            for (x, y), connections in marks.items():
+                shape = tuple(direction in connections for direction in directions)
+                rows[y][x] = "►" if (x, y) in arrows else glyphs.get(shape, "─" if shape[0] or shape[3] else "│")
+            self.edges.update(Text("\n".join("".join(row) for row in rows), no_wrap=True))
+
+    class NodeGraphApp(App[bool]):
+        CSS = """
+        Screen { background: #101722; }
+        #graph-heading { height: 2; padding: 0 1; color: #84e6d5; text-style: bold; }
+        ScrollableContainer { height: 1fr; overflow: auto auto; }
+        #graph-canvas { layers: edges nodes; }
+        #graph-edges { layer: edges; position: absolute; color: #678cb0; }
+        .graph-node { layer: nodes; position: absolute; width: 22; height: 5;
+                      padding: 0 1; border: round #546d8c; background: #1b2839; color: #e3eefb; }
+        .graph-node.selected { border: round #66f4cc; background: #24394a; }
+        """
+        BINDINGS = [
+            Binding("left", "move(-1, 0)", show=False, priority=True),
+            Binding("right", "move(1, 0)", show=False, priority=True),
+            Binding("up", "move(0, -1)", "Move Node", key_display="Arrows", priority=True),
+            Binding("down", "move(0, 1)", show=False, priority=True),
+            Binding("tab", "next_node", "Next Node", priority=True),
+            Binding("g", "timeline", "Timeline"),
+            Binding("q", "quit", "Quit"),
+            *(Binding(str(index), f"select_node({index - 1})", show=False) for index in range(1, 10)),
+        ]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.task_id = task_id
+            self.canvas = GraphCanvas()
+            self.heading = Static(id="graph-heading", markup=False)
+
+        def compose(self) -> ComposeResult:
+            yield self.heading
+            yield ScrollableContainer(self.canvas)
+            yield Footer()
+
+        async def on_mount(self) -> None:
+            await self.refresh_task()
+            self.set_interval(0.5, self.refresh_task)
+
+        async def refresh_task(self) -> None:
+            if self.task_id is None:
+                self.task_id = store.task_for_prompt(prompt_id)
+            if self.task_id is None:
+                self.heading.update("Task graph · Waiting for a plan")
+                return
+            self.heading.update(f"Task graph · {self.task_id}")
+            descriptions, links = graph_canvas_data(store, self.task_id)
+            await self.canvas.sync(descriptions, links)
+
+        def action_move(self, dx: int, dy: int) -> None:
+            self.canvas.move(dx, dy)
+
+        def action_next_node(self) -> None:
+            if self.canvas.nodes:
+                self.canvas.select((self.canvas.active + 1) % len(self.canvas.nodes))
+
+        def action_select_node(self, index: int) -> None:
+            self.canvas.select(index)
+
+        def action_timeline(self) -> None:
+            self.exit(True)
+
+    return NodeGraphApp()
+
+
+def graph_canvas_data(store, task_id):
+    task, prompts, calls = store.graph_activity(task_id)
+    steps = json.loads(task["plan"])["steps"]
+    reports = json.loads(task["reports"])
+    verdict = json.loads(task["review"])["verdict"] if task["review"] else "pending"
+    nodes = {"@prompt": ("Prompt", prompts[-1] if prompts else "Route unavailable"),
+             "@plan": (f"Plan r{task['revision']}", f"{len(steps)} worker steps")}
+    links = [("@prompt", "@plan")]
+    parents = set()
+    for step in steps:
+        key = step["id"]
+        report = reports.get(key, {})
+        agent = report.get("agent_name")
+        status = report.get("status", "pending")
+        nodes[key] = (agent or key, f"{key} · {status}" if agent else status)
+        parents.update(step["needs"])
+        links.extend((parent, key) for parent in step["needs"] or ["@plan"])
+    nodes["@review"] = ("Review", verdict)
+    links.extend((leaf, "@review") for leaf in [step["id"] for step in steps if step["id"] not in parents] or ["@plan"])
+
+    if calls:
+        nodes["@mcp"] = ("MCP", f"{sum(call['calls'] for call in calls)} calls")
+    memory = Counter()
+    for call in calls:
+        actor = call["step_id"] or "@host"
+        if actor not in nodes:
+            nodes[actor] = ("Host" if actor == "@host" else actor, "MCP caller")
+        tool, count = call["name"], call["calls"]
+        key = f"@call:{actor}:{tool}"
+        nodes[key] = (tool, f"{count} calls · {count - call['successes']} errors")
+        if tool == "recall" and call["successes"]:
+            memory["reads"] += call["successes"]
+            links.extend((("@memory", "@mcp"), ("@mcp", key), (key, actor)))
+        else:
+            links.extend(((actor, key), (key, "@mcp")))
+            if tool == "remember" and call["successes"]:
+                memory["writes"] += call["successes"]
+                links.append(("@mcp", "@memory"))
+    if memory:
+        nodes["@memory"] = ("Memory", f"{memory['reads']} reads · {memory['writes']} writes")
+    return nodes, tuple(dict.fromkeys(links))
+
+
 def graph_dashboard(screen, store, task_id, prompt_id=None):
     accents = dashboard_colors()
     offset = 0
@@ -689,7 +950,7 @@ def graph_dashboard(screen, store, task_id, prompt_id=None):
             horizontal = max(0, horizontal - 8)
 
 
-def monitor_dashboard(screen, store, tail, task_id=None):
+def monitor_dashboard(screen, store, tail, task_id=None, canvas=False):
     if task_id and not graph_dashboard(screen, store, task_id):
         return
     db = store.db
@@ -750,6 +1011,8 @@ def monitor_dashboard(screen, store, tail, task_id=None):
         elif key == ord("g") and filtered:
             event = filtered[selected]
             if event["task_id"] or event["kind"] == "route":
+                if canvas:
+                    return event["task_id"], event["id"]
                 if not graph_dashboard(screen, store, event["task_id"], event["id"]):
                     return
         elif key == curses.KEY_END:
@@ -759,13 +1022,36 @@ def monitor_dashboard(screen, store, tail, task_id=None):
             selected_id = filtered[index]["id"]
 
 
-def monitor(path, tail, once, plain=False, task_id=None):
+def monitor(path, tail, once, plain=False, task_id=None, classic=False):
     if not 0 <= tail <= 1000:
         raise ValueError("--tail must be between 0 and 1000")
     store = Store(path)
     with contextlib.closing(store.db) as db:
-        if not once and not plain and terminal_dashboard(monitor_dashboard, store, tail, task_id):
-            return
+        if not once and not plain:
+            interactive = sys.stdin.isatty() and sys.stdout.isatty()
+            if not classic and interactive and os.environ.get("TERM") not in (None, "", "dumb"):
+                try:
+                    import textual
+                except ImportError:
+                    textual = None
+                if textual is not None:
+                    selected = (task_id, None) if task_id else None
+                    while True:
+                        if selected:
+                            if not textual_graph(store, *selected).run():
+                                return
+                        if not curses:
+                            break
+                        try:
+                            selected = curses.wrapper(monitor_dashboard, store, tail, None, True)
+                        except KeyboardInterrupt:
+                            return
+                        except curses.error:
+                            break
+                        if not selected:
+                            return
+            if terminal_dashboard(monitor_dashboard, store, tail, task_id):
+                return
         if task_id:
             print("\n".join(map(terminal_text, task_graph(store, task_id))))
             return
@@ -809,6 +1095,7 @@ def main():
         view.add_argument("--db", type=Path, help="Use a project-specific delegation database")
         view.add_argument("--plain", action="store_true", help="Use plain-text output in a terminal")
     watch.add_argument("--tail", type=int, default=20, help="Recent events to show before following (default: 20)")
+    watch.add_argument("--classic", action="store_true", help="Use the classic terminal graph")
     watch.add_argument("--task", help="Open the dependency graph for this task ID")
     watch.add_argument("--once", action="store_true", help="Print recent events and exit")
     export = commands.add_parser("export", help="Export one task and its reviews as JSON")
@@ -859,7 +1146,7 @@ def main():
         if args.action == "stats":
             stats(database, args.plain)
         else:
-            monitor(database, args.tail, args.once, args.plain, args.task)
+            monitor(database, args.tail, args.once, args.plain, args.task, args.classic)
     elif args.action == "export":
         database = args.db.expanduser() if args.db else root / "state.sqlite3"
         store = Store(database)
