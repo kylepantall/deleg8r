@@ -130,6 +130,56 @@ class InstallTest(unittest.TestCase):
             str(self.launcher),
         )
 
+    @unittest.skipUnless(shutil.which("claude") and shutil.which("codex"), "needs both real client CLIs")
+    def test_doctor_hook_and_unhook(self):
+        self.install("--no-setup")
+        self.codex.mkdir()
+        self.run_command("claude", "mcp", "add", "--scope", "user", "other", "--", "/bin/true")
+        self.run_command("codex", "mcp", "add", "other", "--", "/bin/true")
+        self.run_command(self.launcher, "hook")
+        claude_registry = self.claude / ".claude.json"
+        codex_config = self.codex / "config.toml"
+        codex_hooks = self.codex / "hooks.json"
+        claude_settings = self.claude / "settings.json"
+        paths = (claude_registry, claude_settings, codex_config, codex_hooks)
+        before = {path: path.read_bytes() for path in paths}
+        report = self.run_command(self.launcher, "doctor", check=False)
+        for client in ("claude", "codex"):
+            self.assertIn(f"OK {client} MCP registration", report.stdout)
+            self.assertIn(f"OK {client} hook registration (2/2 user hooks)", report.stdout)
+            self.assertIn(f"OK {client} local MCP handshake", report.stdout)
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
+        event = {"hook_event_name": "UserPromptSubmit", "session_id": "installer-test",
+                 "prompt": "Fix a typo in README.md."}
+        legacy = self.run_command(self.launcher, "hook", "--client", "codex", input=json.dumps(event))
+        self.assertIn("route direct", json.loads(legacy.stdout)["hookSpecificOutput"]["additionalContext"])
+        database = self.state / "state.sqlite3"
+        database_content = database.read_bytes()
+
+        # Test a user hook in the same group as one of ours.
+        previous = json.loads(codex_hooks.read_text())
+        retained = {"type": "command", "command": "true"}
+        previous["hooks"]["PreToolUse"][0]["hooks"].append(retained)
+        codex_hooks.write_text(json.dumps(previous))
+        self.run_command(self.launcher, "unhook", "codex")
+        config = tomllib.loads(codex_config.read_text())
+        self.assertEqual(set(config["mcp_servers"]), {"other"})
+        self.assertTrue(config["features"]["hooks"])
+        self.assertEqual(json.loads(codex_hooks.read_text())["hooks"]["PreToolUse"][0]["hooks"], [retained])
+        self.assertIn("task_delegation", json.loads(claude_registry.read_text())["mcpServers"])
+        detached = self.run_command(self.launcher, "doctor", "codex", check=False)
+        self.assertEqual(detached.returncode, 1)
+        self.assertIn("FAIL codex MCP registration", detached.stdout)
+        self.assertIn("FAIL codex hook registration (0/2 user hooks)", detached.stdout)
+
+        self.run_command(self.launcher, "hook", "codex")
+        self.run_command(self.launcher, "unhook")
+        self.run_command(self.launcher, "unhook")
+        self.assertEqual(set(json.loads(claude_registry.read_text())["mcpServers"]), {"other"})
+        self.assertEqual(set(tomllib.loads(codex_config.read_text())["mcp_servers"]), {"other"})
+        self.assertEqual(database.read_bytes(), database_content)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from delegate import hook_configuration
+from delegate import TRIAGE, hook_configuration
+from models import ROUTE, ask, model_settings
 
 
 APP = "deleg8r"
@@ -54,12 +55,16 @@ def read_json(path):
     return data
 
 
-def install_release(source, revision, root, bin_dir):
+def verify_sqlite():
     with contextlib.closing(sqlite3.connect(":memory:")) as connection:
         try:
             connection.execute("CREATE VIRTUAL TABLE probe USING fts5(content)")
         except sqlite3.OperationalError as error:
             raise ValueError("Python's SQLite library must support FTS5") from error
+
+
+def install_release(source, revision, root, bin_dir):
+    verify_sqlite()
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("Could not identify the source revision")
     launcher = bin_dir / APP
@@ -96,24 +101,48 @@ def install_release(source, revision, root, bin_dir):
     return revision
 
 
-def settings_with_hooks(path, launcher, client):
+def hook_settings(path, launcher, client, install=None):
     data = read_json(path)
-    events = data.setdefault("hooks", {})
+    events = data.get("hooks", {})
     if not isinstance(events, dict):
         raise ValueError(f"Invalid hooks object in {path}")
+    present = []
+    changed = False
     for event, (group,) in hook_configuration([str(launcher)], ["--client", client]).items():
         command = group["hooks"][0]["command"]
-        entries = events.setdefault(event, [])
+        entries = events.get(event, [])
         if not isinstance(entries, list):
             raise ValueError(f"Invalid {event} hooks in {path}")
-        installed = any(
-            isinstance(entry, dict) and isinstance(entry.get("hooks"), list)
-            and any(isinstance(hook, dict) and hook.get("command") == command for hook in entry["hooks"])
-            for entry in entries
-        )
-        if not installed:
-            entries.append(group)
-    return data
+        retained = []
+        installed = False
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                retained.append(entry)
+                continue
+            hooks = entry["hooks"]
+            others = [hook for hook in hooks if not isinstance(hook, dict) or hook.get("command") != command]
+            installed = installed or len(others) != len(hooks)
+            if len(others) == len(hooks) or install is not False:
+                retained.append(entry)
+            elif others:
+                retained.append({**entry, "hooks": others})
+        if installed:
+            present.append(event)
+        if install is True and not installed:
+            events[event] = [*entries, group]
+            changed = True
+        if install is False and installed:
+            if retained:
+                events[event] = retained
+            else:
+                events.pop(event)
+            changed = True
+    if changed:
+        if events:
+            data["hooks"] = events
+        else:
+            data.pop("hooks", None)
+    return data, present, changed
 
 
 def matches_server(existing, launcher, client):
@@ -123,22 +152,27 @@ def matches_server(existing, launcher, client):
     )
 
 
-def register_claude(root, launcher):
+def claude_paths():
     configured = os.environ.get("CLAUDE_CONFIG_DIR")
     home = Path(configured).expanduser() if configured else Path.home() / ".claude"
     registry = home / ".claude.json" if configured else Path.home() / ".claude.json"
-    settings_path = home / "settings.json"
-    existing = read_json(registry).get("mcpServers", {}).get(SERVER)
+    return registry, home / "settings.json"
+
+
+def register_claude(root, launcher):
+    _, settings_path = claude_paths()
+    existing = registered_server(root, "claude")
     if existing is not None and not matches_server(existing, launcher, "claude"):
         raise ValueError("Claude Code already has a different user MCP server named task_delegation")
-    settings = settings_with_hooks(settings_path, launcher, "claude")
+    settings, _, changed = hook_settings(settings_path, launcher, "claude", install=True)
     if existing is None:
         subprocess.run(
             ["claude", "mcp", "add", "--scope", "user", "--transport", "stdio", SERVER, "--",
              str(launcher), "serve", "--client", "claude"],
             cwd=root, check=True,
         )
-    atomic_text(settings_path, json.dumps(settings, indent=2) + "\n")
+    if changed:
+        atomic_text(settings_path, json.dumps(settings, indent=2) + "\n")
 
 
 def codex_json(root, *args):
@@ -146,14 +180,26 @@ def codex_json(root, *args):
     return json.loads(output)
 
 
-def register_codex(root, launcher):
+def codex_paths():
     home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
-    config_path = home / "config.toml"
-    settings_path = home / "hooks.json"
-    existing = next((entry for entry in codex_json(root, "list") if entry["name"] == SERVER), None)
-    if existing is not None and not matches_server(existing.get("transport"), launcher, "codex"):
+    return home / "config.toml", home / "hooks.json"
+
+
+def registered_server(root, client):
+    if client == "claude":
+        registry, _ = claude_paths()
+        return read_json(registry).get("mcpServers", {}).get(SERVER)
+    entry = next((item for item in codex_json(root, "list") if item["name"] == SERVER), None)
+    return entry.get("transport") if entry else None
+
+
+def register_codex(root, launcher):
+    config_path, settings_path = codex_paths()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = registered_server(root, "codex")
+    if existing is not None and not matches_server(existing, launcher, "codex"):
         raise ValueError("Codex already has a different user MCP server named task_delegation")
-    settings = settings_with_hooks(settings_path, launcher, "codex")
+    settings, _, changed = hook_settings(settings_path, launcher, "codex", install=True)
     if existing is None:
         subprocess.run(
             ["codex", "mcp", "add", SERVER, "--", str(launcher), "serve", "--client", "codex"],
@@ -173,15 +219,52 @@ def register_codex(root, launcher):
         except (OSError, ValueError, subprocess.SubprocessError):
             atomic_text(config_path, original)
             raise
-    atomic_text(settings_path, json.dumps(settings, indent=2) + "\n")
+    if changed:
+        atomic_text(settings_path, json.dumps(settings, indent=2) + "\n")
+
+
+def client_names(client):
+    return ("claude", "codex") if client == "auto" else (client,)
+
+
+def unhook(root, bin_dir, client):
+    failures = []
+    found = False
+    launcher = bin_dir / APP
+    for name in client_names(client):
+        if not shutil.which(name):
+            if client != "auto":
+                failures.append(f"{name} is not on PATH")
+            continue
+        found = True
+        _, path = claude_paths() if name == "claude" else codex_paths()
+        try:
+            existing = registered_server(root, name)
+            settings, _, changed = hook_settings(path, launcher, name, install=False)
+            if changed:
+                atomic_text(path, json.dumps(settings, indent=2) + "\n")
+            if matches_server(existing, launcher, name):
+                command = ["claude", "mcp", "remove", "--scope", "user", SERVER] if name == "claude" else [
+                    "codex", "mcp", "remove", SERVER,
+                ]
+                subprocess.run(command, cwd=root, check=True)
+                changed = True
+            if existing is not None and not matches_server(existing, launcher, name):
+                print(f"{name}: kept the existing MCP server owned by another installation.")
+            print(f"{name}: {'unhooked' if changed else 'no deleg8r registration to remove'}.")
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            failures.append(f"{name}: {error}")
+    if failures:
+        raise ValueError("Unhook incomplete. " + " ".join(failures))
+    if not found:
+        print("No supported client CLIs on PATH. Existing client settings were preserved.")
 
 
 def setup(root, bin_dir, client):
     launcher = bin_dir / APP
-    clients = ("claude", "codex") if client == "auto" else (client,)
     configured = []
     failures = []
-    for name in clients:
+    for name in client_names(client):
         if not shutil.which(name):
             if client != "auto":
                 failures.append(f"{name} is not on PATH")
@@ -201,6 +284,81 @@ def setup(root, bin_dir, client):
         print("Run deleg8r setup once Claude Code or Codex is on PATH.")
 
 
+def doctor(root, bin_dir, release, client, live):
+    healthy = True
+
+    def check(label, ready, detail=""):
+        nonlocal healthy
+        healthy = healthy and ready
+        print(f"{'OK' if ready else 'FAIL'} {label}" + (f" ({detail})" if detail else ""))
+
+    verify_sqlite()
+    check("Python and SQLite FTS5", True, sys.version.split()[0])
+    check("curl", bool(shutil.which("curl")))
+    db = root / "state.sqlite3"
+    writable = os.access(root, os.W_OK | os.X_OK) and (not db.exists() or os.access(db, os.W_OK))
+    check("state directory", writable, str(root))
+    override = root / "models.json"
+    model_path = override if override.is_file() else release / "models.json"
+    config = read_json(model_path)
+    found = False
+    for name in client_names(client):
+        binary = shutil.which(name)
+        if not binary and client == "auto":
+            print(f"SKIP {name} (CLI not on PATH)")
+            continue
+        found = True
+        check(f"{name} CLI", bool(binary), binary or "missing")
+        if not binary:
+            continue
+        try:
+            _, path = claude_paths() if name == "claude" else codex_paths()
+            settings, events, _ = hook_settings(path, bin_dir / APP, name)
+            existing = registered_server(root, name)
+            registered = matches_server(existing, bin_dir / APP, name)
+            if name == "codex" and registered:
+                registered = codex_json(root, "get", SERVER).get("enabled", True)
+            check(f"{name} MCP registration", registered)
+            check(f"{name} hook registration", len(events) == 2, f"{len(events)}/2 user hooks")
+            if name == "codex":
+                features = subprocess.check_output(["codex", "features", "list"], cwd=root, text=True,
+                                                   stderr=subprocess.DEVNULL, timeout=8)
+                hooks_enabled = any(
+                    cells[0] == "hooks" and cells[-1] == "true"
+                    for line in features.splitlines() if (cells := line.split())
+                )
+            else:
+                hooks_enabled = settings.get("disableAllHooks") is not True
+            check(f"{name} hooks enabled", hooks_enabled)
+            auth = ["claude", "auth", "status"] if name == "claude" else ["codex", "login", "status"]
+            status = subprocess.run(auth, cwd=root, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=8)
+            check(f"{name} authentication", status.returncode == 0)
+            models = [model_settings(config, name, tier)["model"] for tier in ("triage", "focused", "complex")]
+            check(f"{name} model settings", True, ", ".join(models))
+            with tempfile.TemporaryDirectory(prefix="deleg8r-doctor-") as folder:
+                command = [
+                    sys.executable, str(release / "delegate.py"), "serve", "--client", name,
+                    "--db", str(Path(folder) / "state.sqlite3"), "--models", str(model_path),
+                ]
+                request = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": "2025-11-25"}}
+                response = subprocess.run(command, input=json.dumps(request) + "\n", text=True,
+                                          capture_output=True, check=True, timeout=8)
+                server = json.loads(response.stdout)["result"]["serverInfo"]["name"]
+                check(f"{name} local MCP handshake", server == "task-delegation")
+            if live and status.returncode == 0:
+                ask(config, name, "triage", TRIAGE, {"request": "Fix a typo in README.md."}, ROUTE)
+                check(f"{name} live triage", True)
+        except (KeyError, OSError, TypeError, ValueError, subprocess.SubprocessError) as error:
+            check(f"{name} diagnostics", False, str(error))
+    if not found:
+        check("supported coding client", False, "install Claude Code or Codex")
+    if shutil.which("codex") and client in ("auto", "codex"):
+        print("Confirm Codex hook trust in /hooks or the desktop hook settings.")
+    return healthy
+
+
 def main():
     if sys.version_info < (3, 8):
         raise ValueError("Python 3.8 or newer is required")
@@ -215,9 +373,18 @@ def main():
     install.add_argument("--update", action="store_true")
     commands.add_parser("update", help="Install the latest version from GitHub")
     commands.add_parser("version", help="Show the installed source revision")
-    configuration = commands.add_parser("setup", help="Configure detected coding clients")
+    configuration = commands.add_parser("setup", help="Alias for hook")
     configuration.add_argument("--client", choices=("auto", "claude", "codex"), default="auto")
-    for action in ("serve", "hook", "pre-tool"):
+    hook = commands.add_parser("hook", help="Connect Claude Code, Codex, or both")
+    hook.add_argument("target", nargs="?", choices=("claude", "codex"))
+    # Existing installations invoke this exact form for UserPromptSubmit.
+    hook.add_argument("--client", choices=("claude", "codex"), help=argparse.SUPPRESS)
+    detach = commands.add_parser("unhook", help="Remove deleg8r's client registration and hooks")
+    detach.add_argument("target", nargs="?", choices=("claude", "codex"), default="auto")
+    diagnostics = commands.add_parser("doctor", help="Check installation, client wiring and login")
+    diagnostics.add_argument("target", nargs="?", choices=("claude", "codex"), default="auto")
+    diagnostics.add_argument("--live", action="store_true", help="Also run a small live model request")
+    for action in ("serve", "pre-tool"):
         sub = commands.add_parser(action)
         sub.add_argument("--client", required=True, choices=("claude", "codex"))
     args = parser.parse_args()
@@ -243,6 +410,12 @@ def main():
         print((release / "revision").read_text(encoding="utf-8").strip())
     elif args.action == "setup":
         setup(root, bin_dir, args.client)
+    elif args.action == "hook" and not args.client:
+        setup(root, bin_dir, args.target or "auto")
+    elif args.action == "unhook":
+        unhook(root, bin_dir, args.target)
+    elif args.action == "doctor":
+        sys.exit(0 if doctor(root, bin_dir, release, args.target, args.live) else 1)
     else:
         command = [sys.executable, str(release / "delegate.py"), args.action,
                    "--client", args.client, "--db", str(root / "state.sqlite3")]
