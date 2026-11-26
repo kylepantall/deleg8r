@@ -362,7 +362,7 @@ def doctor(root, bin_dir, release, client, live):
 def main():
     if sys.version_info < (3, 8):
         raise ValueError("Python 3.8 or newer is required")
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(prog=APP, description=__doc__)
     parser.add_argument("--root", type=Path, default=default_root())
     parser.add_argument("--bin-dir", type=Path, default=default_bin())
     commands = parser.add_subparsers(dest="action", required=True)
@@ -380,9 +380,9 @@ def main():
     # Existing installations invoke this exact form for UserPromptSubmit.
     hook.add_argument("--client", choices=("claude", "codex"), help=argparse.SUPPRESS)
     detach = commands.add_parser("unhook", help="Remove deleg8r's client registration and hooks")
-    detach.add_argument("target", nargs="?", choices=("claude", "codex"), default="auto")
+    detach.add_argument("target", nargs="?", choices=("claude", "codex"))
     diagnostics = commands.add_parser("doctor", help="Check installation, client wiring and login")
-    diagnostics.add_argument("target", nargs="?", choices=("claude", "codex"), default="auto")
+    diagnostics.add_argument("target", nargs="?", choices=("claude", "codex"))
     diagnostics.add_argument("--live", action="store_true", help="Also run a small live model request")
     for action in ("serve", "pre-tool"):
         sub = commands.add_parser(action)
@@ -413,9 +413,9 @@ def main():
     elif args.action == "hook" and not args.client:
         setup(root, bin_dir, args.target or "auto")
     elif args.action == "unhook":
-        unhook(root, bin_dir, args.target)
+        unhook(root, bin_dir, args.target or "auto")
     elif args.action == "doctor":
-        sys.exit(0 if doctor(root, bin_dir, release, args.target, args.live) else 1)
+        sys.exit(0 if doctor(root, bin_dir, release, args.target or "auto", args.live) else 1)
     else:
         command = [sys.executable, str(release / "delegate.py"), args.action,
                    "--client", args.client, "--db", str(root / "state.sqlite3")]
